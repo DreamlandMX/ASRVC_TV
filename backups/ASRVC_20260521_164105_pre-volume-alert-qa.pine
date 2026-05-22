@@ -1,0 +1,1790 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//@version=6 
+indicator('ASRVC v2.4.1 General Kernel', overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500, max_bars_back = 1500)
+
+//ASRVC
+//@version=5
+// === Asset/profile helpers ===
+// 跨资产配置
+groupAsset = "资产配置"
+assetMode = input.string("Auto", "资产配置", options=["Auto", "Crypto", "Equity/Index", "FX", "Bond/Rates", "Futures/CFD", "Fund"], tooltip="Auto 会根据 syminfo.type 选择资产 profile；显式模式只切换资产 profile 参数，不启用交易对专属内核。", group=groupAsset)
+
+f_resolveAssetProfile(string mode, string symbolType) =>
+    string resolved = mode
+    if mode == "Auto"
+        resolved := switch symbolType
+            "crypto" => "Crypto"
+            "stock" => "Equity/Index"
+            "index" => "Equity/Index"
+            "forex" => "FX"
+            "bond" => "Bond/Rates"
+            "futures" => "Futures/CFD"
+            "cfd" => "Futures/CFD"
+            "fund" => "Fund"
+            => "Equity/Index"
+    resolved
+
+f_profileMidOffset(string profile) =>
+    switch profile
+        "FX" => 0.9995
+        "Bond/Rates" => 1.0005
+        "Fund" => 1.0000
+        => 1.0000
+
+f_profileVolumeWeight(string profile) =>
+    switch profile
+        "FX" => 0.20
+        "Bond/Rates" => 0.25
+        "Equity/Index" => 0.70
+        "Fund" => 0.45
+        => 1.00
+
+f_smoothValue(float previous, float raw, float factor) =>
+    previous * (1 - factor) + raw * factor
+
+f_clamp(float value, float minValue, float maxValue) =>
+    math.max(minValue, math.min(maxValue, value))
+
+f_profileAsrLengthScale(string profile) =>
+    switch profile
+        "Crypto" => 1.00
+        "Equity/Index" => 1.10
+        "FX" => 1.25
+        "Bond/Rates" => 1.35
+        "Futures/CFD" => 1.00
+        "Fund" => 1.45
+        => 1.10
+
+f_profileProbabilityWeight(string profile) =>
+    switch profile
+        "Crypto" => 1.08
+        "Equity/Index" => 0.96
+        "FX" => 0.86
+        "Bond/Rates" => 0.82
+        "Futures/CFD" => 0.98
+        "Fund" => 0.78
+        => 0.96
+
+f_profilePremiumWeight(string profile) =>
+    profile == "Crypto" ? 1.00 : 0.00
+
+f_monthlyAnchorBlendMax(string profile) =>
+    switch profile
+        "Crypto" => 0.44
+        "Futures/CFD" => 0.52
+        "Equity/Index" => 0.50
+        "FX" => 0.30
+        "Bond/Rates" => 0.28
+        "Fund" => 0.34
+        => 0.50
+
+f_monthlyWidthScale(string profile) =>
+    switch profile
+        "Crypto" => 1.12
+        "Futures/CFD" => 1.18
+        "Equity/Index" => 1.10
+        "FX" => 0.62
+        "Bond/Rates" => 0.68
+        "Fund" => 0.78
+        => 1.00
+
+f_monthlyMoveTrigger(string profile) =>
+    switch profile
+        "Crypto" => 40.0
+        "Futures/CFD" => 24.0
+        "Equity/Index" => 24.0
+        "FX" => 6.0
+        "Bond/Rates" => 8.0
+        "Fund" => 12.0
+        => 24.0
+
+assetProfile = f_resolveAssetProfile(assetMode, syminfo.type)
+crossAssetMidOffset = f_profileMidOffset(assetProfile)
+crossAssetVolumeWeight = f_profileVolumeWeight(assetProfile)
+asrLengthScale = f_profileAsrLengthScale(assetProfile)
+probabilityProfileWeight = f_profileProbabilityWeight(assetProfile)
+cryptoPremiumWeight = f_profilePremiumWeight(assetProfile)
+
+// 量价周期参数
+volPeriod = input.int(1000, "量价周期", minval=10, maxval=1500, tooltip="该数值用于计算平均成交量水平，数值越高，则放量K线的绘制为深颜色的数量越多，数值越低，则放量K线绘制深颜色的数量越少，建议在50-100之间", group="量价分析")
+showVolumeColor = input.bool(true, "显示量价颜色", tooltip="开启后，K线颜色将根据成交量大小变化", group="量价分析")
+volMultiplier = input.float(2.0, "放量倍数", minval=1.1, step=0.1, tooltip="当成交量超过平均成交量的这个倍数时，被视为放量", group="量价分析")
+
+// 量价颜色设置
+normalBullColor = input.color(color.rgb(30, 180, 30, 50), "普通上涨颜色", group="量价颜色")
+normalBearColor = input.color(color.rgb(180, 30, 30, 50), "普通下跌颜色", group="量价颜色")
+highVolBullColor = input.color(color.rgb(20, 255, 20, 0), "放量上涨", group="量价颜色")
+highVolBearColor = input.color(color.rgb(255, 20, 20, 0), "放量下跌", group="量价颜色")
+
+// 获取当前图表时间周期（以分钟为单位）
+// === Timeframe and adaptive profile state ===
+timeframe_minutes = timeframe.in_seconds() / 60
+isMonthlyTf = timeframe.ismonthly or timeframe_minutes >= 40320
+useAsrGeneralKernel = not isMonthlyTf
+useMonthlyGeneralKernel = isMonthlyTf
+isWeeklyEquityProfile = assetMode == "Auto" and timeframe_minutes == 10080 and assetProfile == "Equity/Index" and useAsrGeneralKernel
+// Applies to every asset resolved to the Crypto profile, including manually selected Crypto mode.
+isWeeklyCryptoProfile = timeframe_minutes == 10080 and assetProfile == "Crypto" and useAsrGeneralKernel
+
+// High-beta equity overlay: Auto mode only, driven by large short-term swings.
+int equityHighBetaLen = 20
+if (timeframe_minutes <= 15)
+    equityHighBetaLen := 20
+else if (timeframe_minutes <= 60)
+    equityHighBetaLen := 18
+else if (timeframe_minutes <= 240)
+    equityHighBetaLen := 16
+else if (timeframe_minutes <= 480)
+    equityHighBetaLen := 14
+else if (timeframe_minutes == 1440)
+    equityHighBetaLen := 20
+
+equityHighBetaRangePct = close != 0 ? nz((ta.highest(high, equityHighBetaLen) - ta.lowest(low, equityHighBetaLen)) / close * 100.0, 0.0) : 0.0
+equityHighBetaMovePct = not na(close[equityHighBetaLen]) and close[equityHighBetaLen] != 0 ? nz(math.abs(close - close[equityHighBetaLen]) / close[equityHighBetaLen] * 100.0, 0.0) : 0.0
+equityHighBetaBarPct = not na(close[1]) and close[1] != 0 ? nz(math.abs(close - close[1]) / close[1] * 100.0, 0.0) : 0.0
+equityHighBetaMaxBarPct = nz(ta.highest(equityHighBetaBarPct, equityHighBetaLen), 0.0)
+float equityHighBetaRangeTrigger = 18.0
+if (timeframe_minutes <= 15)
+    equityHighBetaRangeTrigger := 6.0
+else if (timeframe_minutes <= 60)
+    equityHighBetaRangeTrigger := 9.0
+else if (timeframe_minutes <= 180)
+    equityHighBetaRangeTrigger := 13.0
+else if (timeframe_minutes <= 240)
+    equityHighBetaRangeTrigger := 16.0
+else if (timeframe_minutes <= 480)
+    equityHighBetaRangeTrigger := 20.0
+else if (timeframe_minutes == 1440)
+    equityHighBetaRangeTrigger := 35.0
+
+float equityHighBetaMoveTrigger = 12.0
+if (timeframe_minutes <= 15)
+    equityHighBetaMoveTrigger := 4.0
+else if (timeframe_minutes <= 60)
+    equityHighBetaMoveTrigger := 6.0
+else if (timeframe_minutes <= 180)
+    equityHighBetaMoveTrigger := 9.0
+else if (timeframe_minutes <= 240)
+    equityHighBetaMoveTrigger := 11.0
+else if (timeframe_minutes <= 480)
+    equityHighBetaMoveTrigger := 14.0
+else if (timeframe_minutes == 1440)
+    equityHighBetaMoveTrigger := 25.0
+
+float equityHighBetaBarTrigger = 6.5
+if (timeframe_minutes <= 15)
+    equityHighBetaBarTrigger := 2.2
+else if (timeframe_minutes <= 60)
+    equityHighBetaBarTrigger := 3.0
+else if (timeframe_minutes <= 180)
+    equityHighBetaBarTrigger := 4.5
+else if (timeframe_minutes <= 240)
+    equityHighBetaBarTrigger := 5.5
+else if (timeframe_minutes <= 480)
+    equityHighBetaBarTrigger := 6.5
+else if (timeframe_minutes == 1440)
+    equityHighBetaBarTrigger := 9.0
+
+equityHighBetaRangeScore = f_clamp((equityHighBetaRangePct - equityHighBetaRangeTrigger) / (equityHighBetaRangeTrigger * 0.75), 0.0, 1.0)
+equityHighBetaMoveScore = f_clamp((equityHighBetaMovePct - equityHighBetaMoveTrigger) / (equityHighBetaMoveTrigger * 0.75), 0.0, 1.0)
+equityHighBetaBarScore = f_clamp((equityHighBetaMaxBarPct - equityHighBetaBarTrigger) / (equityHighBetaBarTrigger * 0.75), 0.0, 1.0)
+equityHighBetaScoreRaw = math.max(equityHighBetaRangeScore, math.max(equityHighBetaMoveScore, equityHighBetaBarScore))
+equityHighBetaEligible = assetMode == "Auto" and assetProfile == "Equity/Index" and useAsrGeneralKernel
+equityHighBetaScoreWma3 = ta.wma(equityHighBetaScoreRaw, 3)
+equityHighBetaScoreWma4 = ta.wma(equityHighBetaScoreRaw, 4)
+equityHighBetaScoreWma5 = ta.wma(equityHighBetaScoreRaw, 5)
+float equityHighBetaScoreCurve = equityHighBetaScoreWma4
+if (timeframe_minutes <= 15)
+    equityHighBetaScoreCurve := equityHighBetaScoreWma5
+else if (timeframe_minutes <= 60)
+    equityHighBetaScoreCurve := equityHighBetaScoreWma4
+else if (timeframe_minutes == 1440)
+    equityHighBetaScoreCurve := equityHighBetaScoreWma5
+else
+    equityHighBetaScoreCurve := equityHighBetaScoreWma3
+
+equityHighBetaScoreTarget = equityHighBetaEligible ? f_clamp(nz(equityHighBetaScoreCurve, equityHighBetaScoreRaw), 0.0, 1.0) : 0.0
+float equityHighBetaScoreRise = 0.08
+float equityHighBetaScoreFall = 0.04
+if (timeframe_minutes <= 15)
+    equityHighBetaScoreRise := 0.18
+    equityHighBetaScoreFall := 0.07
+else if (timeframe_minutes <= 60)
+    equityHighBetaScoreRise := 0.14
+    equityHighBetaScoreFall := 0.055
+else if (timeframe_minutes <= 180)
+    equityHighBetaScoreRise := 0.12
+    equityHighBetaScoreFall := 0.050
+else if (timeframe_minutes <= 240)
+    equityHighBetaScoreRise := 0.10
+    equityHighBetaScoreFall := 0.045
+else if (timeframe_minutes <= 480)
+    equityHighBetaScoreRise := 0.09
+    equityHighBetaScoreFall := 0.040
+else if (timeframe_minutes == 1440)
+    equityHighBetaScoreRise := 0.20
+    equityHighBetaScoreFall := 0.06
+
+var float equityHighBetaScoreState = na
+if (na(equityHighBetaScoreState) or not equityHighBetaEligible)
+    equityHighBetaScoreState := equityHighBetaScoreTarget
+else
+    float equityHighBetaScoreAlpha = equityHighBetaScoreTarget > equityHighBetaScoreState ? equityHighBetaScoreRise : equityHighBetaScoreFall
+    equityHighBetaScoreState := equityHighBetaScoreState + (equityHighBetaScoreTarget - equityHighBetaScoreState) * equityHighBetaScoreAlpha
+
+equityHighBetaScore = f_clamp(equityHighBetaScoreState, 0.0, 1.0)
+float equityHighBetaWidthAdd = 0.12
+if (timeframe_minutes <= 15)
+    equityHighBetaWidthAdd := 0.55
+else if (timeframe_minutes <= 60)
+    equityHighBetaWidthAdd := 0.38
+else if (timeframe_minutes <= 180)
+    equityHighBetaWidthAdd := 0.34
+else if (timeframe_minutes <= 240)
+    equityHighBetaWidthAdd := 0.30
+else if (timeframe_minutes <= 480)
+    equityHighBetaWidthAdd := 0.28
+else if (timeframe_minutes == 1440)
+    equityHighBetaWidthAdd := 0.30
+
+equityHighBetaWidthMult = 1.0 + equityHighBetaScore * equityHighBetaWidthAdd
+
+float equityHighBetaFastBoostRate = 0.03
+if (timeframe_minutes <= 15)
+    equityHighBetaFastBoostRate := 0.10
+else if (timeframe_minutes <= 60)
+    equityHighBetaFastBoostRate := 0.07
+else if (timeframe_minutes <= 180)
+    equityHighBetaFastBoostRate := 0.065
+else if (timeframe_minutes <= 240)
+    equityHighBetaFastBoostRate := 0.060
+else if (timeframe_minutes <= 480)
+    equityHighBetaFastBoostRate := 0.055
+else if (timeframe_minutes == 1440)
+    equityHighBetaFastBoostRate := 0.08
+
+float equityHighBetaSlowCutRate = 0.02
+if (timeframe_minutes <= 15)
+    equityHighBetaSlowCutRate := 0.07
+else if (timeframe_minutes <= 60)
+    equityHighBetaSlowCutRate := 0.05
+else if (timeframe_minutes <= 180)
+    equityHighBetaSlowCutRate := 0.045
+else if (timeframe_minutes <= 240)
+    equityHighBetaSlowCutRate := 0.040
+else if (timeframe_minutes <= 480)
+    equityHighBetaSlowCutRate := 0.035
+else if (timeframe_minutes == 1440)
+    equityHighBetaSlowCutRate := 0.05
+
+float equityHighBetaSmoothBoostRate = 0.00
+if (timeframe_minutes <= 15)
+    equityHighBetaSmoothBoostRate := 0.08
+else if (timeframe_minutes <= 60)
+    equityHighBetaSmoothBoostRate := 0.05
+else if (timeframe_minutes <= 180)
+    equityHighBetaSmoothBoostRate := 0.060
+else if (timeframe_minutes <= 240)
+    equityHighBetaSmoothBoostRate := 0.055
+else if (timeframe_minutes <= 480)
+    equityHighBetaSmoothBoostRate := 0.050
+else if (timeframe_minutes == 1440)
+    equityHighBetaSmoothBoostRate := 0.18
+
+equityHighBetaFastBoost = equityHighBetaScore * equityHighBetaFastBoostRate
+equityHighBetaSlowCut = equityHighBetaScore * equityHighBetaSlowCutRate
+equityHighBetaSmoothBoost = equityHighBetaScore * equityHighBetaSmoothBoostRate
+
+// 日线级别所需的变量初始化 - 确保全局定义在使用前
+var sma_length = 150   // 日线使用150天SMA (分析显示这是原始值)
+var mid_adjust = 0.960 // 中轨调整系数 (分析验证)
+var upper_mult = 0.507 // 上部通道倍数 (分析计算: (135688.87-90066.57)/90066.57≈0.507)
+var lower_mult = 0.507 // 下部通道倍数 (分析计算: (90066.57-44444.27)/90066.57≈0.507)
+
+// 通道分布系数 - 各通道线在区间内的精确相对位置 (通过价格点分析得出)
+var ou_ratio = 1.000   // 超买线位置
+var o1_ratio = 0.658   // 橙色上轨位置 ((120078.3-90066.57)/45622.3≈0.658)
+var o2_ratio = 0.499   // 橙色中轨位置 ((112877.67-90066.57)/45622.3≈0.499)
+var o3_ratio = 0.351   // 橙色下轨位置 ((106091.63-90066.57)/45622.3≈0.351)
+var o4_ratio = 0.250   // 中间上轨位置 ((101472.12-90066.57)/45622.3≈0.25)
+var o6_ratio = 0.250   // 中间下轨位置 ((90066.57-78661.02)/45622.3≈0.25)
+var o7_ratio = 0.345   // 蓝色上轨位置 ((90066.57-74360.69)/45622.3≈0.345)
+var o8_ratio = 0.500   // 蓝色中轨位置 ((90066.57-67255.47)/45622.3≈0.5)
+var o9_ratio = 0.651   // 蓝色下轨位置 ((90066.57-60374.02)/45622.3≈0.651)
+var ol_ratio = 1.000   // 超卖线位置
+
+// 比例系数
+var ratio0 = 0.0  // 超买线
+var ratio1 = 0.0  // 橙色上轨
+var ratio2 = 0.0  // 橙色中轨
+var ratio3 = 0.0  // 橙色下轨
+var ratio4 = 0.0  // 中间上轨
+var ratio5 = 0.0  // 中间基准
+var ratio6 = 0.0  // 中间下轨
+var ratio7 = 0.0  // 蓝色上轨
+var ratio8 = 0.0  // 蓝色中轨
+var ratio9 = 0.0  // 蓝色下轨
+var ratio10 = 0.0 // 超卖线
+
+adxLen = input.int(14, "ADX周期", minval=5, maxval=50, group="趋势设置")
+adxThresh = input.int(25, "趋势ADX阈值", minval=10, maxval=50, group="趋势设置")
+trendMethod = input.string("ADX", "趋势判断方法", options=["ADX", "方向性", "两者结合"], group="趋势设置")
+
+// 显示设置
+showMomentumInfo = input.bool(true, "显示动量信息", group="显示设置")
+momentumLength = input.int(10, "动量计算周期", minval=5, maxval=50, group="显示设置")
+showTradeSignals = input.bool(true, "显示交易信号", tooltip="显示基于当前价格位置和趋势的交易信号", group="显示设置")
+cleanMode = input.bool(false, "Clean Mode", tooltip="Disable fills and heavier visual helpers while keeping the core channel and table.", group="显示设置")
+tableMode = input.string("Compact", "Panel Mode", options=["Mini", "Compact", "Full"], tooltip="Mini keeps the essential state/probability/confidence context. Compact adds signal, volume and volatility context. Full shows all panel details.", group="显示设置")
+panelPositionInput = input.string("Bottom Left", "Panel Position", options=["Bottom Left", "Bottom Right", "Top Left", "Top Right"], tooltip="Move the information panel to reduce chart overlap.", group="显示设置")
+alertQualityFilter = input.string("Balanced", "Alert Quality Filter", options=["Off", "Balanced", "Strict"], tooltip="Off preserves raw alerts. Balanced and Strict require stronger confidence or probability confirmation before alerts fire.", group="显示设置")
+showProbabilityInfo = input.bool(true, "Show Probability System", tooltip="Display ASR v1.5-style reference probabilities in the information panel.", group="显示设置")
+
+// 根据时间周期自动设置参数（仅用于4小时及以上）
+get_avg_length() =>
+    if (timeframe_minutes == 240)
+        80  // 4小时图 - 从120减少到80以提高价格水平
+    else if (timeframe_minutes <= 5)
+        600  // 5分钟及以下使用更长的均线，减少噪音
+    else if (timeframe_minutes <= 15)
+        480
+    else if (timeframe_minutes <= 60)
+        360  // 1小时及以下
+    else if (timeframe_minutes <= 180)
+        240  // 3小时及以下
+    else if (isMonthlyTf)
+        24
+    else
+        120  // 其他情况
+
+// 自动计算参数（用于4小时及以上）
+auto_avgLength = get_avg_length()
+
+// 平均长度基础值（用于4小时以下）
+avgLength = timeframe_minutes < 240 ? 120 : auto_avgLength
+
+// 基础价格调整（仅用于1小时及以下）
+price_adjust = 0.0
+if (timeframe_minutes == 3)
+    price_adjust := -0.0030  // 3分钟价格微调参数 - 调整以消除约315点的偏差
+else if (timeframe_minutes == 5)
+    price_adjust := -0.001  // 5分钟价格微调参数
+else if (timeframe_minutes == 15)
+    price_adjust := -0.002
+else if (timeframe_minutes == 30)
+    price_adjust := -0.015  // 修改从-0.025到-0.015，提升中轨位置
+else if (timeframe_minutes == 60)
+    avgLength := 240  // Adjust 1H averaging period
+else if (timeframe_minutes == 1440)
+    avgLength := 120  // 日线使用较短的周期
+else if (timeframe_minutes == 10080)
+    avgLength := 30   // 周线使用更短的周期
+else if (isMonthlyTf)
+    avgLength := 24
+    
+// 对于1小时级别使用动态计算方式
+weeklyMidLine = isWeeklyEquityProfile ? ta.sma(close, avgLength) : ta.sma(close, avgLength) * 1.448
+midLine = timeframe_minutes == 60 ?
+          ta.sma(close, avgLength) * 0.995 :
+          timeframe_minutes == 1440 ?
+              ta.sma(close, sma_length) * mid_adjust :
+          timeframe_minutes == 10080 ?
+              weeklyMidLine :
+          isMonthlyTf ?
+              ta.sma(close, avgLength) :
+          timeframe_minutes >= 240 ? ta.sma(close, auto_avgLength) * 1.01 :
+          ta.wma(close * (1 + price_adjust), avgLength)
+
+// Smoothing factor by timeframe.
+smoothing = timeframe_minutes == 60 ? 1 :
+           timeframe_minutes == 1440 ? 1 :
+           isMonthlyTf ? 2 :
+           timeframe_minutes <= 5 ? 4 :
+           timeframe_minutes <= 15 ? 3 :
+           timeframe_minutes <= 45 ? 2 :
+           timeframe_minutes <= 240 ? 2 : 1
+
+// Timeframe generic ratio ladder.
+// === Generic ratio ladder ===
+if (timeframe_minutes == 60)
+    // 1H generic ladder
+    ratio0 := 1.0783
+    ratio1 := 1.0490
+    ratio2 := 1.0392
+    ratio3 := 1.0290
+    ratio4 := 1.0196
+    ratio5 := 1.0000
+    ratio6 := 0.9804
+    ratio7 := 0.9708
+    ratio8 := 0.9608
+    ratio9 := 0.9509
+    ratio10 := 0.9217
+else if (timeframe_minutes >= 240 and timeframe_minutes != 1440 and timeframe_minutes != 10080 and not isMonthlyTf)
+    // 4H+ generic ladder
+    ratio0 := 1.188
+    ratio1 := 1.122
+    ratio2 := 1.091
+    ratio3 := 1.062
+    ratio4 := 1.043
+    ratio5 := 0.995
+    ratio6 := 0.946
+    ratio7 := 0.928
+    ratio8 := 0.897
+    ratio9 := 0.856
+    ratio10 := 0.800
+else if (timeframe_minutes == 1440)
+    // Daily generic ladder
+    ratio0 := 1.497
+    ratio1 := 1.330
+    ratio2 := 1.248
+    ratio3 := 1.165
+    ratio4 := 1.123
+    ratio5 := 0.999
+    ratio6 := 0.876
+    ratio7 := 0.835
+    ratio8 := 0.752
+    ratio9 := 0.667
+    ratio10 := 0.502
+else if (timeframe_minutes == 15)
+    // 15m generic ladder
+    ratio0 := 1.0363
+    ratio1 := 1.0230
+    ratio2 := 1.0181
+    ratio3 := 1.0135
+    ratio4 := 1.0091
+    ratio5 := 1.0000
+    ratio6 := 0.9910
+    ratio7 := 0.9868
+    ratio8 := 0.9819
+    ratio9 := 0.9764
+    ratio10 := 0.9636
+else if (timeframe_minutes == 5)
+    // 5m generic ladder
+    ratio0 := 1.0226
+    ratio1 := 1.0143
+    ratio2 := 1.0113
+    ratio3 := 1.0085
+    ratio4 := 1.0056
+    ratio5 := 1.0000
+    ratio6 := 0.9943
+    ratio7 := 0.9917
+    ratio8 := 0.9887
+    ratio9 := 0.9857
+    ratio10 := 0.9774
+else if (timeframe_minutes == 3)
+    // 3m generic ladder
+    ratio0 := 1.0224
+    ratio1 := 1.0147
+    ratio2 := 1.0119
+    ratio3 := 1.0090
+    ratio4 := 1.0045
+    ratio5 := 1.0000
+    ratio6 := 0.9955
+    ratio7 := 0.9910
+    ratio8 := 0.9866
+    ratio9 := 0.9821
+    ratio10 := 0.9776
+else if (timeframe_minutes == 1)
+    // 1m generic ladder
+    ratio0 := 1.0222
+    ratio1 := 1.0134
+    ratio2 := 1.0101
+    ratio3 := 1.0076
+    ratio4 := 1.0051
+    ratio5 := 1.0000
+    ratio6 := 0.9949
+    ratio7 := 0.9924
+    ratio8 := 0.9899
+    ratio9 := 0.9867
+    ratio10 := 0.9778
+else if (timeframe_minutes < 1)
+    // Sub-1m generic ladder
+    ratio0 := 1.0192
+    ratio1 := 1.0124
+    ratio2 := 1.0091
+    ratio3 := 1.0066
+    ratio4 := 1.0041
+    ratio5 := 1.0000
+    ratio6 := 0.9959
+    ratio7 := 0.9934
+    ratio8 := 0.9909
+    ratio9 := 0.9877
+    ratio10 := 0.9808
+else if (timeframe_minutes == 30)
+    // 30m generic ladder
+    ratio0 := 1.070
+    ratio1 := 1.048
+    ratio2 := 1.041
+    ratio3 := 1.033
+    ratio4 := 1.027
+    ratio5 := 1.012
+    ratio6 := 0.996
+    ratio7 := 0.990
+    ratio8 := 0.983
+    ratio9 := 0.974
+    ratio10 := 0.955
+else if (timeframe_minutes == 45)
+    // 45m generic ladder
+    ratio0 := 1.090
+    ratio1 := 1.064
+    ratio2 := 1.054
+    ratio3 := 1.045
+    ratio4 := 1.037
+    ratio5 := 1.020
+    ratio6 := 1.001
+    ratio7 := 0.996
+    ratio8 := 0.987
+    ratio9 := 0.978
+    ratio10 := 0.948
+else if (timeframe_minutes == 120)
+    // 2H generic ladder
+    ratio0 := 1.117
+    ratio1 := 1.074
+    ratio2 := 1.055
+    ratio3 := 1.037
+    ratio4 := 1.024
+    ratio5 := 0.993
+    ratio6 := 0.963
+    ratio7 := 0.951
+    ratio8 := 0.932
+    ratio9 := 0.912
+    ratio10 := 0.870
+else if (timeframe_minutes == 180)
+    // 3H generic ladder
+    ratio0 := 1.148
+    ratio1 := 1.093
+    ratio2 := 1.070
+    ratio3 := 1.049
+    ratio4 := 1.031
+    ratio5 := 0.992
+    ratio6 := 0.953
+    ratio7 := 0.938
+    ratio8 := 0.914
+    ratio9 := 0.890
+    ratio10 := 0.835
+else if (timeframe_minutes == 10080) // Weekly timeframe (7 days * 24 hours * 60 minutes)
+    if (isWeeklyEquityProfile)
+        // Weekly Equity/Index ladder.
+        ratio0 := 1.78
+        ratio1 := 1.46
+        ratio2 := 1.32
+        ratio3 := 1.20
+        ratio4 := 1.10
+        ratio5 := 1.00
+        ratio6 := 0.90
+        ratio7 := 0.82
+        ratio8 := 0.70
+        ratio9 := 0.58
+        ratio10 := 0.38
+    else if (isWeeklyCryptoProfile)
+        // Weekly Crypto ladder for all Crypto profile assets; keeps weekly broader than monthly without legacy overshoot.
+        ratio0 := 1.64
+        ratio1 := 1.44
+        ratio2 := 1.33
+        ratio3 := 1.23
+        ratio4 := 1.12
+        ratio5 := 1.00
+        ratio6 := 0.89
+        ratio7 := 0.80
+        ratio8 := 0.70
+        ratio9 := 0.58
+        ratio10 := 0.42
+    else
+        // Non-Crypto weekly high-volatility fallback.
+        ratio0 := 2.857
+        ratio1 := 2.366
+        ratio2 := 2.152
+        ratio3 := 1.953
+        ratio4 := 1.800
+        ratio5 := 1.448
+        ratio6 := 1.097
+        ratio7 := 0.945
+        ratio8 := 0.745
+        ratio9 := 0.548
+        ratio10 := 0.041
+else if (isMonthlyTf)
+    ratio0 := 1.36
+    ratio1 := 1.24
+    ratio2 := 1.16
+    ratio3 := 1.09
+    ratio4 := 1.04
+    ratio5 := 1.00
+    ratio6 := 0.94
+    ratio7 := 0.88
+    ratio8 := 0.80
+    ratio9 := 0.72
+    ratio10 := 0.58
+else
+    ratio0 := 1.047
+    ratio1 := 1.030
+    ratio2 := 1.024
+    ratio3 := 1.017
+    ratio4 := 1.012
+    ratio5 := 1.000
+    ratio6 := 0.988
+    ratio7 := 0.983
+    ratio8 := 0.976
+    ratio9 := 0.971
+    ratio10 := 0.953
+
+// Generic ratio seed. ASR General overrides this for all active profiles.
+// === Generic ratio seed construction ===
+useRawRatio = (timeframe_minutes >= 240 and not isMonthlyTf) or timeframe_minutes == 60 or timeframe_minutes == 1440
+
+overbought = 0.0
+orangeUpper = 0.0
+orangeMid = 0.0
+orangeLower = 0.0
+midUpper = 0.0
+midMid = 0.0
+midLower = 0.0
+blueUpper = 0.0
+blueMid = 0.0
+blueLower = 0.0
+oversold = 0.0
+
+if (timeframe_minutes == 1440)
+    float base_mid = ta.sma(close, sma_length) * mid_adjust
+    float upper_band = upper_mult * base_mid
+    float lower_band = lower_mult * base_mid
+
+    midMid := base_mid
+    overbought := base_mid + upper_band * ou_ratio
+    orangeUpper := base_mid + upper_band * o1_ratio
+    orangeMid := base_mid + upper_band * o2_ratio
+    orangeLower := base_mid + upper_band * o3_ratio
+    midUpper := base_mid + upper_band * o4_ratio
+    midLower := base_mid - lower_band * o6_ratio
+    blueUpper := base_mid - lower_band * o7_ratio
+    blueMid := base_mid - lower_band * o8_ratio
+    blueLower := base_mid - lower_band * o9_ratio
+    oversold := base_mid - lower_band * ol_ratio
+else
+    overbought := useRawRatio ? midLine * ratio0 : ta.wma(midLine * ratio0, smoothing)
+    orangeUpper := useRawRatio ? midLine * ratio1 : ta.wma(midLine * ratio1, smoothing)
+
+    if (timeframe_minutes == 60)
+        orangeMid_value = midLine * ratio2
+        orangeLow_value = midLine * ratio3
+        if (ratio2 < ratio3)
+            orangeMid := orangeLow_value * 1.002
+            orangeLower := orangeLow_value
+        else
+            orangeMid := useRawRatio ? midLine * ratio2 : ta.wma(midLine * ratio2, smoothing)
+            orangeLower := useRawRatio ? midLine * ratio3 : ta.wma(midLine * ratio3, smoothing)
+    else
+        orangeMid := useRawRatio ? midLine * ratio2 : ta.wma(midLine * ratio2, smoothing)
+        orangeLower := useRawRatio ? midLine * ratio3 : ta.wma(midLine * ratio3, smoothing)
+
+    midUpper := useRawRatio ? midLine * ratio4 : ta.wma(midLine * ratio4, smoothing)
+    midMid := useRawRatio ? midLine * ratio5 : ta.wma(midLine * ratio5, smoothing)
+    midLower := useRawRatio ? midLine * ratio6 : ta.wma(midLine * ratio6, smoothing)
+    blueUpper := useRawRatio ? midLine * ratio7 : ta.wma(midLine * ratio7, smoothing)
+
+    if (timeframe_minutes == 60 and ratio8 > ratio7)
+        blueMid := blueUpper * 0.998
+    else
+        blueMid := useRawRatio ? midLine * ratio8 : ta.wma(midLine * ratio8, smoothing)
+
+    blueLower := useRawRatio ? midLine * ratio9 : ta.wma(midLine * ratio9, smoothing)
+    oversold := useRawRatio ? midLine * ratio10 : ta.wma(midLine * ratio10, smoothing)
+
+// === ASR General Kernel ===
+// All asset profiles use smoothed ASR mid/width, then derive the rainbow channel.
+asrHigh6 = nz(ta.sma(high, 6), high)
+asrLow6 = nz(ta.sma(low, 6), low)
+asrHigh13 = nz(ta.sma(high, 13), high)
+asrLow13 = nz(ta.sma(low, 13), low)
+asrHigh24 = nz(ta.sma(high, 24), high)
+asrLow24 = nz(ta.sma(low, 24), low)
+asrHigh20 = ta.sma(high, 20)
+asrLow20 = ta.sma(low, 20)
+asrHigh34 = ta.sma(high, 34)
+asrLow34 = ta.sma(low, 34)
+asrHigh40 = ta.sma(high, 40)
+asrLow40 = ta.sma(low, 40)
+asrHigh55 = ta.sma(high, 55)
+asrLow55 = ta.sma(low, 55)
+asrHigh65 = ta.sma(high, 65)
+asrLow65 = ta.sma(low, 65)
+asrHigh68 = ta.sma(high, 68)
+asrLow68 = ta.sma(low, 68)
+asrHigh80 = ta.sma(high, 80)
+asrLow80 = ta.sma(low, 80)
+asrHigh110 = ta.sma(high, 110)
+asrLow110 = ta.sma(low, 110)
+asrHigh120 = ta.sma(high, 120)
+asrLow120 = ta.sma(low, 120)
+asrHigh130 = ta.sma(high, 130)
+asrLow130 = ta.sma(low, 130)
+asrHigh136 = ta.sma(high, 136)
+asrLow136 = ta.sma(low, 136)
+asrHigh160 = ta.sma(high, 160)
+asrLow160 = ta.sma(low, 160)
+asrHigh220 = ta.sma(high, 220)
+asrLow220 = ta.sma(low, 220)
+asrHigh260 = ta.sma(high, 260)
+asrLow260 = ta.sma(low, 260)
+asrHigh300 = ta.sma(high, 300)
+asrLow300 = ta.sma(low, 300)
+
+asrFastHigh = isMonthlyTf ? asrHigh6 :
+              timeframe_minutes <= 5 ? asrHigh34 :
+              timeframe_minutes <= 15 ? asrHigh55 :
+              timeframe_minutes <= 60 ? asrHigh65 :
+              timeframe_minutes <= 180 ? asrHigh80 :
+              timeframe_minutes <= 240 ? asrHigh80 :
+              timeframe_minutes <= 1440 ? asrHigh34 :
+              asrHigh20
+asrFastLow = isMonthlyTf ? asrLow6 :
+             timeframe_minutes <= 5 ? asrLow34 :
+             timeframe_minutes <= 15 ? asrLow55 :
+             timeframe_minutes <= 60 ? asrLow65 :
+             timeframe_minutes <= 180 ? asrLow80 :
+             timeframe_minutes <= 240 ? asrLow80 :
+             timeframe_minutes <= 1440 ? asrLow34 :
+             asrLow20
+asrBaseHigh = isMonthlyTf ? asrHigh13 :
+              timeframe_minutes <= 5 ? asrHigh68 :
+              timeframe_minutes <= 15 ? asrHigh120 :
+              timeframe_minutes <= 60 ? asrHigh130 :
+              timeframe_minutes <= 180 ? asrHigh160 :
+              timeframe_minutes <= 240 ? asrHigh160 :
+              timeframe_minutes <= 1440 ? asrHigh68 :
+              asrHigh40
+asrBaseLow = isMonthlyTf ? asrLow13 :
+             timeframe_minutes <= 5 ? asrLow68 :
+             timeframe_minutes <= 15 ? asrLow120 :
+             timeframe_minutes <= 60 ? asrLow130 :
+             timeframe_minutes <= 180 ? asrLow160 :
+             timeframe_minutes <= 240 ? asrLow160 :
+             timeframe_minutes <= 1440 ? asrLow68 :
+             asrLow40
+asrSlowHigh = isMonthlyTf ? asrHigh24 :
+              timeframe_minutes <= 5 ? asrHigh136 :
+              timeframe_minutes <= 15 ? asrHigh220 :
+              timeframe_minutes <= 60 ? asrHigh260 :
+              timeframe_minutes <= 180 ? asrHigh300 :
+              timeframe_minutes <= 240 ? asrHigh300 :
+              timeframe_minutes <= 1440 ? asrHigh136 :
+              asrHigh80
+asrSlowLow = isMonthlyTf ? asrLow24 :
+             timeframe_minutes <= 5 ? asrLow136 :
+             timeframe_minutes <= 15 ? asrLow220 :
+             timeframe_minutes <= 60 ? asrLow260 :
+             timeframe_minutes <= 180 ? asrLow300 :
+             timeframe_minutes <= 240 ? asrLow300 :
+             timeframe_minutes <= 1440 ? asrLow136 :
+             asrLow80
+
+asrFastMid = (asrFastHigh + asrFastLow) / 2.0
+asrBaseMid = (asrBaseHigh + asrBaseLow) / 2.0
+asrSlowMid = (asrSlowHigh + asrSlowLow) / 2.0
+asrFastSlopePct = not na(asrFastMid[3]) and asrFastMid[3] != 0 ? (asrFastMid - asrFastMid[3]) / asrFastMid[3] * 100.0 : 0.0
+asrBaseSlopePct = not na(asrBaseMid[5]) and asrBaseMid[5] != 0 ? (asrBaseMid - asrBaseMid[5]) / asrBaseMid[5] * 100.0 : 0.0
+asrSlowSlopePct = not na(asrSlowMid[8]) and asrSlowMid[8] != 0 ? (asrSlowMid - asrSlowMid[8]) / asrSlowMid[8] * 100.0 : 0.0
+asrTurnPressure = math.sign(asrFastSlopePct) != math.sign(asrSlowSlopePct) ? 1.0 : 0.0
+asrSlopeDivergence = f_clamp(math.abs(asrFastSlopePct - asrSlowSlopePct) * 75.0, 0.0, 1.0)
+asrAtrValueLocal = ta.atr(14)
+equityExtensionEligible = equityHighBetaEligible and timeframe_minutes >= 1 and timeframe_minutes <= 1440
+int equityExtensionLen = 20
+if (timeframe_minutes <= 15)
+    equityExtensionLen := 20
+else if (timeframe_minutes <= 60)
+    equityExtensionLen := 18
+else if (timeframe_minutes <= 180)
+    equityExtensionLen := 16
+else if (timeframe_minutes <= 480)
+    equityExtensionLen := 14
+else if (timeframe_minutes == 1440)
+    equityExtensionLen := 20
+
+float equityExtensionRangeTrigger = 6.0
+float equityExtensionMoveTrigger = 4.0
+float equityExtensionBarTrigger = 2.2
+float equityExtensionAtrTrigger = 2.8
+if (timeframe_minutes <= 15)
+    equityExtensionRangeTrigger := 6.0
+    equityExtensionMoveTrigger := 4.0
+    equityExtensionBarTrigger := 2.2
+    equityExtensionAtrTrigger := 2.8
+else if (timeframe_minutes <= 60)
+    equityExtensionRangeTrigger := 10.0
+    equityExtensionMoveTrigger := 6.0
+    equityExtensionBarTrigger := 3.0
+    equityExtensionAtrTrigger := 3.0
+else if (timeframe_minutes <= 180)
+    equityExtensionRangeTrigger := 14.0
+    equityExtensionMoveTrigger := 9.0
+    equityExtensionBarTrigger := 4.5
+    equityExtensionAtrTrigger := 3.2
+else if (timeframe_minutes <= 240)
+    equityExtensionRangeTrigger := 18.0
+    equityExtensionMoveTrigger := 12.0
+    equityExtensionBarTrigger := 5.5
+    equityExtensionAtrTrigger := 3.4
+else if (timeframe_minutes <= 480)
+    equityExtensionRangeTrigger := 22.0
+    equityExtensionMoveTrigger := 15.0
+    equityExtensionBarTrigger := 6.5
+    equityExtensionAtrTrigger := 3.6
+else if (timeframe_minutes == 1440)
+    equityExtensionRangeTrigger := 35.0
+    equityExtensionMoveTrigger := 25.0
+    equityExtensionBarTrigger := 9.0
+    equityExtensionAtrTrigger := 3.5
+
+equityExtensionRangePct = close != 0 ? nz((ta.highest(high, equityExtensionLen) - ta.lowest(low, equityExtensionLen)) / close * 100.0, 0.0) : 0.0
+equityExtensionRange40Pct = close != 0 ? nz((ta.highest(high, 40) - ta.lowest(low, 40)) / close * 100.0, 0.0) : 0.0
+equityExtensionRange60Pct = close != 0 ? nz((ta.highest(high, 60) - ta.lowest(low, 60)) / close * 100.0, 0.0) : 0.0
+equityExtensionMovePct = not na(close[equityExtensionLen]) and close[equityExtensionLen] != 0 ? nz(math.abs(close - close[equityExtensionLen]) / close[equityExtensionLen] * 100.0, 0.0) : 0.0
+equityExtensionMaxBarPct = nz(ta.highest(equityHighBetaBarPct, equityExtensionLen), 0.0)
+equityExtensionDistanceAtr = asrAtrValueLocal > 0 ? math.abs(close - asrBaseMid) / asrAtrValueLocal : 0.0
+equityExtensionVolumeSma20 = ta.sma(volume, 20)
+float equityExtensionVolumeScore = 0.0
+if (not na(volume) and volume > 0 and not na(equityExtensionVolumeSma20) and equityExtensionVolumeSma20 > 0)
+    float equityExtensionVolumeRatio = volume / equityExtensionVolumeSma20
+    equityExtensionVolumeScore := f_clamp((equityExtensionVolumeRatio - 1.8) / 1.2, 0.0, 1.0) * 0.35
+
+equityExtensionRangeScore = f_clamp((equityExtensionRangePct - equityExtensionRangeTrigger) / (equityExtensionRangeTrigger * 0.75), 0.0, 1.0)
+equityExtensionRange40Score = timeframe_minutes == 1440 ? f_clamp((equityExtensionRange40Pct - 50.0) / (50.0 * 0.75), 0.0, 1.0) : 0.0
+equityExtensionRange60Score = timeframe_minutes == 1440 ? f_clamp((equityExtensionRange60Pct - 70.0) / (70.0 * 0.75), 0.0, 1.0) : 0.0
+equityExtensionMoveScore = f_clamp((equityExtensionMovePct - equityExtensionMoveTrigger) / (equityExtensionMoveTrigger * 0.75), 0.0, 1.0)
+equityExtensionBarScore = f_clamp((equityExtensionMaxBarPct - equityExtensionBarTrigger) / (equityExtensionBarTrigger * 0.75), 0.0, 1.0)
+equityExtensionDistanceScore = f_clamp((equityExtensionDistanceAtr - equityExtensionAtrTrigger) / math.max(equityExtensionAtrTrigger * 0.60, 1.0), 0.0, 1.0)
+equityExtensionRangeComposite = math.max(equityExtensionRangeScore, math.max(equityExtensionRange40Score, equityExtensionRange60Score))
+equityExtensionScoreRawBase = math.max(equityExtensionRangeComposite, math.max(equityExtensionMoveScore, math.max(equityExtensionBarScore, math.max(equityExtensionDistanceScore, equityExtensionVolumeScore))))
+equityExtensionScoreRaw = math.max(equityHighBetaScore, equityExtensionScoreRawBase)
+equityExtensionScoreCurve = ta.wma(equityExtensionScoreRaw, 5)
+equityExtensionScoreTarget = equityExtensionEligible ? f_clamp(nz(equityExtensionScoreCurve, equityExtensionScoreRaw), 0.0, 1.0) : 0.0
+float equityExtensionRise = 0.18
+float equityExtensionFall = 0.06
+if (timeframe_minutes <= 60)
+    equityExtensionRise := 0.22
+    equityExtensionFall := 0.075
+else if (timeframe_minutes <= 180)
+    equityExtensionRise := 0.18
+    equityExtensionFall := 0.060
+else if (timeframe_minutes <= 480)
+    equityExtensionRise := 0.16
+    equityExtensionFall := 0.055
+else if (timeframe_minutes == 1440)
+    equityExtensionRise := 0.20
+    equityExtensionFall := 0.060
+
+var float equityExtensionScoreState = na
+if (na(equityExtensionScoreState) or not equityExtensionEligible)
+    equityExtensionScoreState := equityExtensionScoreTarget
+else
+    float equityExtensionAlpha = equityExtensionScoreTarget > equityExtensionScoreState ? equityExtensionRise : equityExtensionFall
+    equityExtensionScoreState := equityExtensionScoreState + (equityExtensionScoreTarget - equityExtensionScoreState) * equityExtensionAlpha
+
+equityExtensionScore = f_clamp(nz(equityExtensionScoreState, 0.0), 0.0, 1.0)
+float equityExtensionFastBoostRate = 0.00
+float equityExtensionSlowCutRate = 0.00
+float equityExtensionSmoothBoostRate = 0.00
+if (timeframe_minutes <= 60)
+    equityExtensionFastBoostRate := 0.035
+    equityExtensionSlowCutRate := 0.025
+    equityExtensionSmoothBoostRate := 0.030
+else if (timeframe_minutes <= 180)
+    equityExtensionFastBoostRate := 0.040
+    equityExtensionSlowCutRate := 0.030
+    equityExtensionSmoothBoostRate := 0.035
+else if (timeframe_minutes <= 480)
+    equityExtensionFastBoostRate := 0.055
+    equityExtensionSlowCutRate := 0.040
+    equityExtensionSmoothBoostRate := 0.045
+else if (timeframe_minutes == 1440)
+    equityExtensionFastBoostRate := 0.050
+    equityExtensionSlowCutRate := 0.035
+    equityExtensionSmoothBoostRate := 0.060
+
+equityExtensionFastBoost = equityExtensionScore * equityExtensionFastBoostRate
+equityExtensionSlowCut = equityExtensionScore * equityExtensionSlowCutRate
+equityExtensionSmoothBoost = equityExtensionScore * equityExtensionSmoothBoostRate
+
+// Weekly-only equity extension: fixes stock weekly channels without touching intraday/daily behavior.
+equityWeeklyExtensionEligible = equityHighBetaEligible and timeframe_minutes == 10080
+equityWeeklyRange26Pct = close != 0 ? nz((ta.highest(high, 26) - ta.lowest(low, 26)) / close * 100.0, 0.0) : 0.0
+equityWeeklyRange52Pct = close != 0 ? nz((ta.highest(high, 52) - ta.lowest(low, 52)) / close * 100.0, 0.0) : 0.0
+equityWeeklyMove13Pct = not na(close[13]) and close[13] != 0 ? nz(math.abs(close - close[13]) / close[13] * 100.0, 0.0) : 0.0
+equityWeeklyMove26Pct = not na(close[26]) and close[26] != 0 ? nz(math.abs(close - close[26]) / close[26] * 100.0, 0.0) : 0.0
+equityWeeklyMaxBarPct = nz(ta.highest(equityHighBetaBarPct, 26), 0.0)
+equityWeeklyDistanceAtr = asrAtrValueLocal > 0 ? math.abs(close - asrBaseMid) / asrAtrValueLocal : 0.0
+equityWeeklyVolumeSma20 = ta.sma(volume, 20)
+float equityWeeklyVolumeScore = 0.0
+if (not na(volume) and volume > 0 and not na(equityWeeklyVolumeSma20) and equityWeeklyVolumeSma20 > 0)
+    float equityWeeklyVolumeRatio = volume / equityWeeklyVolumeSma20
+    equityWeeklyVolumeScore := f_clamp((equityWeeklyVolumeRatio - 1.6) / 1.4, 0.0, 1.0) * 0.30
+
+equityWeeklyRange26Score = f_clamp((equityWeeklyRange26Pct - 40.0) / (40.0 * 0.80), 0.0, 1.0)
+equityWeeklyRange52Score = f_clamp((equityWeeklyRange52Pct - 65.0) / (65.0 * 0.80), 0.0, 1.0)
+equityWeeklyMove13Score = f_clamp((equityWeeklyMove13Pct - 20.0) / (20.0 * 0.80), 0.0, 1.0)
+equityWeeklyMove26Score = f_clamp((equityWeeklyMove26Pct - 30.0) / (30.0 * 0.80), 0.0, 1.0)
+equityWeeklyBarScore = f_clamp((equityWeeklyMaxBarPct - 12.0) / (12.0 * 0.80), 0.0, 1.0)
+equityWeeklyDistanceScore = f_clamp((equityWeeklyDistanceAtr - 3.0) / 1.8, 0.0, 1.0)
+equityWeeklyRangeScore = math.max(equityWeeklyRange26Score, equityWeeklyRange52Score)
+equityWeeklyMoveScore = math.max(equityWeeklyMove13Score, equityWeeklyMove26Score)
+equityWeeklyExtensionScoreRaw = math.max(equityWeeklyRangeScore, math.max(equityWeeklyMoveScore, math.max(equityWeeklyBarScore, math.max(equityWeeklyDistanceScore, equityWeeklyVolumeScore))))
+equityWeeklyExtensionScoreCurve = ta.wma(equityWeeklyExtensionScoreRaw, 4)
+equityWeeklyExtensionScoreTarget = equityWeeklyExtensionEligible ? f_clamp(nz(equityWeeklyExtensionScoreCurve, equityWeeklyExtensionScoreRaw), 0.0, 1.0) : 0.0
+var float equityWeeklyExtensionScoreState = na
+if (na(equityWeeklyExtensionScoreState) or not equityWeeklyExtensionEligible)
+    equityWeeklyExtensionScoreState := equityWeeklyExtensionScoreTarget
+else
+    float equityWeeklyExtensionScoreAlpha = equityWeeklyExtensionScoreTarget > equityWeeklyExtensionScoreState ? 0.10 : 0.035
+    equityWeeklyExtensionScoreState := equityWeeklyExtensionScoreState + (equityWeeklyExtensionScoreTarget - equityWeeklyExtensionScoreState) * equityWeeklyExtensionScoreAlpha
+
+equityWeeklyExtensionScore = f_clamp(nz(equityWeeklyExtensionScoreState, 0.0), 0.0, 1.0)
+equityWeeklyFastBoost = equityWeeklyExtensionScore * 0.025
+equityWeeklySlowCut = equityWeeklyExtensionScore * 0.018
+equityWeeklySmoothBoost = equityWeeklyExtensionScore * 0.035
+equityAsrExtensionEligible = equityExtensionEligible or equityWeeklyExtensionEligible
+equityAsrExtensionScore = equityWeeklyExtensionEligible ? equityWeeklyExtensionScore : equityExtensionScore
+equityAsrExtensionFastBoost = equityExtensionFastBoost + equityWeeklyFastBoost
+equityAsrExtensionSlowCut = equityExtensionSlowCut + equityWeeklySlowCut
+equityAsrExtensionSmoothBoost = equityExtensionSmoothBoost + equityWeeklySmoothBoost
+equityAsrHighBetaWidthMult = equityWeeklyExtensionEligible ? 1.0 : equityHighBetaWidthMult
+equityAsrHighBetaFastBoost = equityWeeklyExtensionEligible ? 0.0 : equityHighBetaFastBoost
+equityAsrHighBetaSlowCut = equityWeeklyExtensionEligible ? 0.0 : equityHighBetaSlowCut
+equityAsrHighBetaSmoothBoost = equityWeeklyExtensionEligible ? 0.0 : equityHighBetaSmoothBoost
+asrDistancePull = asrAtrValueLocal != 0 ? f_clamp(math.abs(close - asrBaseMid) / asrAtrValueLocal, 0.0, 3.0) : 0.0
+asrTurnBlend = math.max(asrTurnPressure, asrSlopeDivergence)
+asrProfileFastBias = assetProfile == "FX" or assetProfile == "Bond/Rates" or assetProfile == "Fund" ? -0.04 : assetProfile == "Equity/Index" or assetProfile == "Futures/CFD" ? 0.02 : 0.00
+asrFastWeight = f_clamp(0.24 + asrTurnBlend * 0.16 + asrDistancePull * 0.020 + asrProfileFastBias + equityAsrHighBetaFastBoost + equityAsrExtensionFastBoost, 0.18, 0.56)
+asrSlowWeight = f_clamp(0.22 + (asrLengthScale - 1.0) * 0.10 - asrTurnBlend * 0.05 - equityAsrHighBetaSlowCut - equityAsrExtensionSlowCut, 0.08, 0.34)
+asrBaseWeight = math.max(0.12, 1.0 - asrFastWeight - asrSlowWeight)
+asrWeightTotal = asrFastWeight + asrBaseWeight + asrSlowWeight
+asrFastWeight := asrFastWeight / asrWeightTotal
+asrBaseWeight := asrBaseWeight / asrWeightTotal
+asrSlowWeight := asrSlowWeight / asrWeightTotal
+
+asrMidRaw = asrFastMid * asrFastWeight + asrBaseMid * asrBaseWeight + asrSlowMid * asrSlowWeight
+asrAtrPctLocal = close != 0 ? asrAtrValueLocal / close * 100.0 : 0.0
+asrAtrLowLocal = ta.lowest(asrAtrPctLocal, 120)
+asrAtrHighLocal = ta.highest(asrAtrPctLocal, 120)
+asrAtrRankLocal = asrAtrHighLocal > asrAtrLowLocal ? f_clamp((asrAtrPctLocal - asrAtrLowLocal) / (asrAtrHighLocal - asrAtrLowLocal) * 100.0, 0.0, 100.0) : 50.0
+asrSlopePct = asrBaseSlopePct
+
+monthlyMoveTrigger = f_monthlyMoveTrigger(assetProfile)
+monthlyMove6Pct = not na(close[6]) and close[6] != 0 ? nz((close - close[6]) / close[6] * 100.0, 0.0) : 0.0
+monthlyMove12Pct = not na(close[12]) and close[12] != 0 ? nz((close - close[12]) / close[12] * 100.0, 0.0) : 0.0
+monthlyMove24Pct = not na(close[24]) and close[24] != 0 ? nz((close - close[24]) / close[24] * 100.0, 0.0) : 0.0
+monthlyMove6Score = f_clamp((math.abs(monthlyMove6Pct) - monthlyMoveTrigger * 0.45) / math.max(monthlyMoveTrigger * 0.90, 1.0), 0.0, 1.0)
+monthlyMove12Score = f_clamp((math.abs(monthlyMove12Pct) - monthlyMoveTrigger) / math.max(monthlyMoveTrigger, 1.0), 0.0, 1.0)
+monthlyMove24Score = f_clamp((math.abs(monthlyMove24Pct) - monthlyMoveTrigger * 1.55) / math.max(monthlyMoveTrigger * 1.20, 1.0), 0.0, 1.0)
+monthlyDistanceAtr = asrAtrValueLocal > 0 ? math.abs(close - asrMidRaw) / asrAtrValueLocal : 0.0
+monthlyDistanceScore = f_clamp((monthlyDistanceAtr - 2.0) / 2.4, 0.0, 1.0)
+monthlySlopeScore = f_clamp((math.abs(asrSlopePct) - 1.2) / 3.5, 0.0, 1.0)
+monthlyAtrRankScore = f_clamp((asrAtrRankLocal - 35.0) / 55.0, 0.0, 1.0) * 0.65
+monthlyTrendExtensionScoreRawBase = math.max(math.max(monthlyMove6Score, math.max(monthlyMove12Score, monthlyMove24Score)), math.max(monthlyDistanceScore, math.max(monthlySlopeScore, monthlyAtrRankScore)))
+monthlyHistoryFactor = isMonthlyTf and assetProfile == "Crypto" ? f_clamp((bar_index + 1) / 18.0, 0.35, 1.0) : 1.0
+monthlyTrendExtensionScoreRaw = monthlyTrendExtensionScoreRawBase * monthlyHistoryFactor
+monthlyTrendExtensionScoreCurve = ta.wma(monthlyTrendExtensionScoreRaw, 3)
+monthlyTrendExtensionEligible = useMonthlyGeneralKernel
+monthlyTrendExtensionScoreTarget = monthlyTrendExtensionEligible ? f_clamp(nz(monthlyTrendExtensionScoreCurve, monthlyTrendExtensionScoreRaw), 0.0, 1.0) : 0.0
+var float monthlyTrendExtensionScoreState = na
+if (na(monthlyTrendExtensionScoreState) or not monthlyTrendExtensionEligible)
+    monthlyTrendExtensionScoreState := monthlyTrendExtensionScoreTarget
+else
+    float monthlyTrendExtensionScoreAlpha = monthlyTrendExtensionScoreTarget > monthlyTrendExtensionScoreState ? 0.18 : 0.055
+    monthlyTrendExtensionScoreState := monthlyTrendExtensionScoreState + (monthlyTrendExtensionScoreTarget - monthlyTrendExtensionScoreState) * monthlyTrendExtensionScoreAlpha
+
+monthlyTrendExtensionScore = f_clamp(nz(monthlyTrendExtensionScoreState, 0.0), 0.0, 1.0)
+
+// Daily-only high-beta extension layer for large non-hardcoded equity runs.
+equityDailyHighBetaEligible = equityHighBetaEligible and timeframe_minutes == 1440
+equityDailyRange20Pct = close != 0 ? nz((ta.highest(high, 20) - ta.lowest(low, 20)) / close * 100.0, 0.0) : 0.0
+equityDailyRange40Pct = close != 0 ? nz((ta.highest(high, 40) - ta.lowest(low, 40)) / close * 100.0, 0.0) : 0.0
+equityDailyRange60Pct = close != 0 ? nz((ta.highest(high, 60) - ta.lowest(low, 60)) / close * 100.0, 0.0) : 0.0
+equityDailyMove20Pct = not na(close[20]) and close[20] != 0 ? nz(math.abs(close - close[20]) / close[20] * 100.0, 0.0) : 0.0
+equityDailyMaxBarPct = nz(ta.highest(equityHighBetaBarPct, 20), 0.0)
+equityDailyDistanceAtr = asrAtrValueLocal > 0 ? math.abs(close - asrBaseMid) / asrAtrValueLocal : 0.0
+equityDailyVolumeSma20 = ta.sma(volume, 20)
+float equityDailyVolumeScore = 0.0
+if (not na(volume) and volume > 0 and not na(equityDailyVolumeSma20) and equityDailyVolumeSma20 > 0)
+    float equityDailyVolumeRatio = volume / equityDailyVolumeSma20
+    equityDailyVolumeScore := f_clamp((equityDailyVolumeRatio - 1.8) / 1.2, 0.0, 1.0) * 0.45
+
+equityDailyRange20Score = f_clamp((equityDailyRange20Pct - 35.0) / (35.0 * 0.75), 0.0, 1.0)
+equityDailyRange40Score = f_clamp((equityDailyRange40Pct - 50.0) / (50.0 * 0.75), 0.0, 1.0)
+equityDailyRange60Score = f_clamp((equityDailyRange60Pct - 70.0) / (70.0 * 0.75), 0.0, 1.0)
+equityDailyMove20Score = f_clamp((equityDailyMove20Pct - 25.0) / (25.0 * 0.75), 0.0, 1.0)
+equityDailyBarScore = f_clamp((equityDailyMaxBarPct - 9.0) / (9.0 * 0.75), 0.0, 1.0)
+equityDailyDistanceScore = f_clamp((equityDailyDistanceAtr - 3.5) / 2.0, 0.0, 1.0)
+equityDailyRangeScore = math.max(equityDailyRange20Score, math.max(equityDailyRange40Score, equityDailyRange60Score))
+equityDailyHighBetaScoreRaw = math.max(equityDailyRangeScore, math.max(equityDailyMove20Score, math.max(equityDailyBarScore, math.max(equityDailyDistanceScore, equityDailyVolumeScore))))
+equityDailyHighBetaScoreCurve = ta.wma(equityDailyHighBetaScoreRaw, 5)
+equityDailyHighBetaScoreTarget = equityDailyHighBetaEligible ? f_clamp(nz(equityDailyHighBetaScoreCurve, equityDailyHighBetaScoreRaw), 0.0, 1.0) : 0.0
+var float equityDailyHighBetaScoreState = na
+if (na(equityDailyHighBetaScoreState) or not equityDailyHighBetaEligible)
+    equityDailyHighBetaScoreState := equityDailyHighBetaScoreTarget
+else
+    float equityDailyHighBetaScoreAlpha = equityDailyHighBetaScoreTarget > equityDailyHighBetaScoreState ? 0.20 : 0.06
+    equityDailyHighBetaScoreState := equityDailyHighBetaScoreState + (equityDailyHighBetaScoreTarget - equityDailyHighBetaScoreState) * equityDailyHighBetaScoreAlpha
+
+equityDailyHighBetaScore = f_clamp(nz(equityDailyHighBetaScoreState, 0.0), 0.0, 1.0)
+
+asrMidWma2 = ta.wma(asrMidRaw, 2)
+asrMidWma3 = ta.wma(asrMidRaw, 3)
+asrMidWma4 = ta.wma(asrMidRaw, 4)
+float asrMidCurve = asrMidRaw
+if (timeframe_minutes <= 5)
+    asrMidCurve := asrMidWma4
+else if (timeframe_minutes <= 15)
+    asrMidCurve := asrMidWma3
+else if (timeframe_minutes <= 240)
+    asrMidCurve := asrMidWma2
+else if (isMonthlyTf)
+    asrMidCurve := asrMidWma2
+
+asrExtensionEma8 = ta.ema(hlc3, 8)
+asrExtensionEma10 = ta.ema(hlc3, 10)
+asrExtensionEma13 = ta.ema(hlc3, 13)
+asrExtensionLinreg8 = ta.linreg(hlc3, 8, 0)
+asrExtensionLinreg10 = ta.linreg(hlc3, 10, 0)
+asrExtensionLinreg13 = ta.linreg(hlc3, 13, 0)
+asrExtensionEma21 = ta.ema(hlc3, 21)
+asrExtensionLinreg26 = ta.linreg(hlc3, 26, 0)
+float asrExtensionEmaAnchor = asrExtensionEma13
+float asrExtensionLinregAnchor = asrExtensionLinreg13
+if (timeframe_minutes <= 60)
+    asrExtensionEmaAnchor := asrExtensionEma13
+    asrExtensionLinregAnchor := asrExtensionLinreg13
+else if (timeframe_minutes <= 180)
+    asrExtensionEmaAnchor := asrExtensionEma10
+    asrExtensionLinregAnchor := asrExtensionLinreg10
+else if (timeframe_minutes <= 480)
+    asrExtensionEmaAnchor := asrExtensionEma8
+    asrExtensionLinregAnchor := asrExtensionLinreg8
+else if (timeframe_minutes == 1440)
+    asrExtensionEmaAnchor := asrExtensionEma13
+    asrExtensionLinregAnchor := asrExtensionLinreg13
+else if (timeframe_minutes == 10080)
+    asrExtensionEmaAnchor := asrExtensionEma21
+    asrExtensionLinregAnchor := asrExtensionLinreg26
+else if (isMonthlyTf)
+    asrExtensionEmaAnchor := asrExtensionEma8
+    asrExtensionLinregAnchor := asrExtensionLinreg10
+
+if (useAsrGeneralKernel or useMonthlyGeneralKernel)
+    asrUseRatioSeedBase = timeframe_minutes >= 240 and timeframe_minutes != 1440 and timeframe_minutes != 10080 and not isMonthlyTf
+    float asrSmoothMidBase = nz(asrUseRatioSeedBase ? midLine : asrMidCurve * crossAssetMidOffset, close)
+    float asrSmoothMidRaw = asrSmoothMidBase
+    if (monthlyTrendExtensionEligible and monthlyTrendExtensionScore > 0.0)
+        float asrMonthlyTrendAnchor = nz(asrExtensionEmaAnchor * 0.65 + asrExtensionLinregAnchor * 0.35, asrSmoothMidBase)
+        float asrMonthlyAnchorBlend = f_monthlyAnchorBlendMax(assetProfile) * monthlyTrendExtensionScore
+        asrSmoothMidRaw := asrSmoothMidBase * (1.0 - asrMonthlyAnchorBlend) + asrMonthlyTrendAnchor * asrMonthlyAnchorBlend
+    else if (equityAsrExtensionEligible and equityAsrExtensionScore > 0.0)
+        float asrExtensionFastAnchor = nz(asrExtensionEmaAnchor * 0.70 + asrExtensionLinregAnchor * 0.30, asrSmoothMidBase)
+        float asrExtensionAnchorBlendMax = 0.24
+        if (timeframe_minutes <= 60)
+            asrExtensionAnchorBlendMax := 0.24
+        else if (timeframe_minutes <= 180)
+            asrExtensionAnchorBlendMax := 0.30
+        else if (timeframe_minutes <= 480)
+            asrExtensionAnchorBlendMax := 0.40
+        else if (timeframe_minutes == 1440)
+            asrExtensionAnchorBlendMax := 0.35
+        else if (timeframe_minutes == 10080)
+            asrExtensionAnchorBlendMax := 0.22
+        float asrExtensionAnchorBlend = asrExtensionAnchorBlendMax * equityAsrExtensionScore
+        asrSmoothMidRaw := asrSmoothMidBase * (1.0 - asrExtensionAnchorBlend) + asrExtensionFastAnchor * asrExtensionAnchorBlend
+
+    float asrNoSawBaseFactor = 0.22
+    if (timeframe_minutes <= 5)
+        asrNoSawBaseFactor := 0.30
+    else if (timeframe_minutes <= 15)
+        asrNoSawBaseFactor := 0.26
+    else if (timeframe_minutes <= 30)
+        asrNoSawBaseFactor := 0.22
+    else if (timeframe_minutes <= 60)
+        asrNoSawBaseFactor := 0.18
+    else if (timeframe_minutes <= 180)
+        asrNoSawBaseFactor := 0.20
+    else if (timeframe_minutes <= 240)
+        asrNoSawBaseFactor := 0.30
+    else if (isMonthlyTf)
+        asrNoSawBaseFactor := 0.24
+
+    float asrNoSawMaxFactor = equityAsrExtensionEligible ? 0.42 : 0.38
+    if (equityExtensionEligible and timeframe_minutes <= 480)
+        asrNoSawMaxFactor := 0.44
+    else if (equityWeeklyExtensionEligible)
+        asrNoSawMaxFactor := 0.36
+    else if (monthlyTrendExtensionEligible)
+        asrNoSawMaxFactor := 0.40
+    asrNoSawFactor = asrUseRatioSeedBase ? 1.00 : f_clamp(asrNoSawBaseFactor + equityAsrHighBetaSmoothBoost + equityAsrExtensionSmoothBoost + monthlyTrendExtensionScore * 0.06, 0.10, asrNoSawMaxFactor)
+    var float asrGeneralSmoothMid = na
+    float asrSmoothResetThreshold = math.max(asrAtrValueLocal * 18.0, close * 0.08)
+    if (equityAsrExtensionEligible)
+        asrSmoothResetThreshold := math.max(asrAtrValueLocal * 20.0, close * 0.12)
+    else if (monthlyTrendExtensionEligible)
+        asrSmoothResetThreshold := math.max(asrAtrValueLocal * 14.0, close * 0.18)
+
+    if (na(asrGeneralSmoothMid))
+        asrGeneralSmoothMid := asrSmoothMidRaw
+    else if (not na(asrAtrValueLocal) and asrAtrValueLocal > 0 and math.abs(asrSmoothMidRaw - asrGeneralSmoothMid) > asrSmoothResetThreshold)
+        asrGeneralSmoothMid := asrSmoothMidRaw
+    else
+        asrGeneralSmoothMid := f_smoothValue(asrGeneralSmoothMid, asrSmoothMidRaw, asrNoSawFactor)
+
+    asrSmoothMid = asrGeneralSmoothMid
+    float asrGeneralWidthScaleRaw = 1.00
+    if (isMonthlyTf)
+        float asrMonthlyWidthBoostRate = assetProfile == "Crypto" ? 0.06 : 0.10
+        asrGeneralWidthScaleRaw := f_monthlyWidthScale(assetProfile) * (1.0 + monthlyTrendExtensionScore * asrMonthlyWidthBoostRate)
+    else if (assetProfile == "Equity/Index")
+        float asrExtensionWidthAdd = 0.32
+        if (timeframe_minutes <= 60)
+            asrExtensionWidthAdd := 0.40
+        else if (timeframe_minutes <= 180)
+            asrExtensionWidthAdd := 0.36
+        else if (timeframe_minutes <= 480)
+            asrExtensionWidthAdd := 0.34
+        else if (timeframe_minutes == 1440)
+            asrExtensionWidthAdd := 0.32
+        else if (timeframe_minutes == 10080)
+            asrExtensionWidthAdd := 0.22
+        if (asrUseRatioSeedBase and not equityAsrExtensionEligible)
+            asrGeneralWidthScaleRaw := 1.00
+        else if (equityAsrExtensionEligible)
+            asrGeneralWidthScaleRaw := math.max(equityAsrHighBetaWidthMult, 1.0 + equityAsrExtensionScore * asrExtensionWidthAdd)
+        else
+            asrGeneralWidthScaleRaw := equityAsrHighBetaWidthMult
+    else if (assetProfile == "FX")
+        asrGeneralWidthScaleRaw := 0.78
+    else if (assetProfile == "Bond/Rates")
+        asrGeneralWidthScaleRaw := 0.82
+    else if (assetProfile == "Fund")
+        asrGeneralWidthScaleRaw := 0.86
+
+    float asrWidthScaleRise = 0.12
+    float asrWidthScaleFall = 0.08
+    if (timeframe_minutes <= 15)
+        asrWidthScaleRise := 0.22
+        asrWidthScaleFall := 0.09
+    else if (timeframe_minutes <= 60)
+        asrWidthScaleRise := 0.16
+        asrWidthScaleFall := 0.075
+    else if (timeframe_minutes <= 240)
+        asrWidthScaleRise := 0.12
+        asrWidthScaleFall := 0.065
+    else if (timeframe_minutes <= 480)
+        asrWidthScaleRise := 0.14
+        asrWidthScaleFall := 0.060
+    else if (timeframe_minutes == 1440)
+        asrWidthScaleRise := 0.18
+        asrWidthScaleFall := 0.06
+    else if (timeframe_minutes == 10080)
+        asrWidthScaleRise := 0.10
+        asrWidthScaleFall := 0.035
+    else if (isMonthlyTf)
+        asrWidthScaleRise := 0.14
+        asrWidthScaleFall := 0.045
+
+    var float asrGeneralSmoothWidthScale = na
+    if (na(asrGeneralSmoothWidthScale) or asrUseRatioSeedBase or (assetProfile != "Equity/Index" and not isMonthlyTf))
+        asrGeneralSmoothWidthScale := asrGeneralWidthScaleRaw
+    else
+        float asrWidthScaleAlpha = asrGeneralWidthScaleRaw > asrGeneralSmoothWidthScale ? asrWidthScaleRise : asrWidthScaleFall
+        asrGeneralSmoothWidthScale := asrGeneralSmoothWidthScale + (asrGeneralWidthScaleRaw - asrGeneralSmoothWidthScale) * asrWidthScaleAlpha
+
+    asrGeneralWidthScale = asrGeneralSmoothWidthScale
+    float asrUpperWidthScale = asrGeneralWidthScale
+    float asrLowerWidthScale = asrGeneralWidthScale
+    var float asrDailySmoothUpperScale = na
+    var float asrDailySmoothLowerScale = na
+    if (not equityAsrExtensionEligible)
+        asrDailySmoothUpperScale := asrGeneralWidthScale
+        asrDailySmoothLowerScale := asrGeneralWidthScale
+    else
+        float asrDailyUpperBase = math.max(asrSmoothMid * ratio1, syminfo.mintick)
+        float asrDailyLowerBase = math.max(asrSmoothMid * ratio9, syminfo.mintick)
+        float asrExtensionPressureDenom = 0.10
+        float asrExtensionUpperExtra = 0.22
+        float asrExtensionLowerFromUpper = 0.08
+        float asrExtensionLowerFromLower = 0.20
+        if (timeframe_minutes <= 60)
+            asrExtensionPressureDenom := 0.08
+            asrExtensionUpperExtra := 0.18
+        else if (timeframe_minutes <= 180)
+            asrExtensionPressureDenom := 0.10
+            asrExtensionUpperExtra := 0.22
+        else if (timeframe_minutes <= 480)
+            asrExtensionPressureDenom := 0.12
+            asrExtensionUpperExtra := 0.30
+        else if (timeframe_minutes == 1440)
+            asrExtensionPressureDenom := 0.14
+            asrExtensionUpperExtra := 0.25
+        else if (timeframe_minutes == 10080)
+            asrExtensionPressureDenom := 0.18
+            asrExtensionUpperExtra := 0.14
+            asrExtensionLowerFromUpper := 0.04
+            asrExtensionLowerFromLower := 0.12
+        float asrDailyUpperPressure = close > asrDailyUpperBase ? f_clamp((close / asrDailyUpperBase - 1.0) / asrExtensionPressureDenom, 0.0, 1.0) : 0.0
+        float asrDailyLowerPressure = close > syminfo.mintick and close < asrDailyLowerBase ? f_clamp((asrDailyLowerBase / close - 1.0) / asrExtensionPressureDenom, 0.0, 1.0) : 0.0
+        float asrDailyLowerExtra = math.max(asrDailyUpperPressure * asrExtensionLowerFromUpper, asrDailyLowerPressure * asrExtensionLowerFromLower)
+        float asrDailyUpperScaleRaw = asrGeneralWidthScale * (1.0 + equityAsrExtensionScore * asrDailyUpperPressure * asrExtensionUpperExtra)
+        float asrDailyLowerScaleRaw = asrGeneralWidthScale * (1.0 + equityAsrExtensionScore * asrDailyLowerExtra)
+        if (na(asrDailySmoothUpperScale) or na(asrDailySmoothLowerScale))
+            asrDailySmoothUpperScale := asrDailyUpperScaleRaw
+            asrDailySmoothLowerScale := asrDailyLowerScaleRaw
+        else
+            float asrDailyUpperAlpha = asrDailyUpperScaleRaw > asrDailySmoothUpperScale ? 0.24 : 0.08
+            float asrDailyLowerAlpha = asrDailyLowerScaleRaw > asrDailySmoothLowerScale ? 0.14 : 0.06
+            if (timeframe_minutes == 10080)
+                asrDailyUpperAlpha := asrDailyUpperScaleRaw > asrDailySmoothUpperScale ? 0.12 : 0.04
+                asrDailyLowerAlpha := asrDailyLowerScaleRaw > asrDailySmoothLowerScale ? 0.08 : 0.035
+            asrDailySmoothUpperScale := asrDailySmoothUpperScale + (asrDailyUpperScaleRaw - asrDailySmoothUpperScale) * asrDailyUpperAlpha
+            asrDailySmoothLowerScale := asrDailySmoothLowerScale + (asrDailyLowerScaleRaw - asrDailySmoothLowerScale) * asrDailyLowerAlpha
+        asrUpperWidthScale := asrDailySmoothUpperScale
+        asrLowerWidthScale := asrDailySmoothLowerScale
+
+    // Preserve the original ASRVC per-timeframe channel shape; 4H+ uses the ratio seed base for alignment.
+    overbought := asrSmoothMid + (asrSmoothMid * ratio0 - asrSmoothMid) * asrUpperWidthScale
+    orangeUpper := asrSmoothMid + (asrSmoothMid * ratio1 - asrSmoothMid) * asrUpperWidthScale
+    orangeMid := asrSmoothMid + (asrSmoothMid * ratio2 - asrSmoothMid) * asrUpperWidthScale
+    orangeLower := asrSmoothMid + (asrSmoothMid * ratio3 - asrSmoothMid) * asrUpperWidthScale
+    midUpper := asrSmoothMid + (asrSmoothMid * ratio4 - asrSmoothMid) * asrUpperWidthScale
+    midMid := asrSmoothMid + (asrSmoothMid * ratio5 - asrSmoothMid) * asrGeneralWidthScale
+    midLower := asrSmoothMid + (asrSmoothMid * ratio6 - asrSmoothMid) * asrLowerWidthScale
+    blueUpper := asrSmoothMid + (asrSmoothMid * ratio7 - asrSmoothMid) * asrLowerWidthScale
+    blueMid := asrSmoothMid + (asrSmoothMid * ratio8 - asrSmoothMid) * asrLowerWidthScale
+    blueLower := asrSmoothMid + (asrSmoothMid * ratio9 - asrSmoothMid) * asrLowerWidthScale
+    oversold := asrSmoothMid + (asrSmoothMid * ratio10 - asrSmoothMid) * asrLowerWidthScale
+
+// 判断是否为趋势行情 - 需要在switch之前计算ADX
+[diPlus, diMinus, adx] = ta.dmi(adxLen, adxThresh)
+
+// 方向一致性判断：连续上涨或下跌的条数
+directionLen = 5
+upCount = 0
+downCount = 0
+for i = 0 to directionLen - 1
+    if close[i] > close[i+1]
+        upCount += 1
+    else if close[i] < close[i+1]
+        downCount += 1
+
+dirStrength = math.max(upCount, downCount) / directionLen // 方向强度
+
+// 在全局作用域定义趋势变量
+uptrend = close > midMid
+downtrend = close < midMid
+
+// 根据选择的方法判断趋势
+isTrend = switch trendMethod
+    "ADX" => adx > adxThresh
+    "方向性" => dirStrength > 0.7  // 70%以上的K线方向一致
+    "两者结合" => adx > adxThresh * 0.8 and dirStrength > 0.6  // 两个指标都达到一定程度
+    => adx > adxThresh  // 默认使用ADX
+
+// 量价分析功能
+// 计算移动平均成交量
+avgVol = ta.sma(volume, volPeriod)
+volumeAvailable = not na(volume) and volume > 0 and not na(avgVol) and avgVol > 0
+profileVolumeThreshold = crossAssetVolumeWeight > 0 ? volMultiplier / crossAssetVolumeWeight : volMultiplier * 10.0
+
+// 判断当前K线成交量相对于平均成交量的倍数；FX/债券/基金等成交量不稳定市场自动降权。
+isVolume = volumeAvailable and volume >= avgVol * profileVolumeThreshold
+
+// 跨资产状态机：保留原版 ADX/方向性趋势判断，再补充波动率和压缩状态。
+crossAssetAtrValue = ta.atr(14)
+crossAssetAtrPct = close != 0 ? crossAssetAtrValue / close * 100 : 0.0
+crossAssetAtrLow = ta.lowest(crossAssetAtrPct, 120)
+crossAssetAtrHigh = ta.highest(crossAssetAtrPct, 120)
+crossAssetAtrRank = crossAssetAtrHigh > crossAssetAtrLow ? math.max(0.0, math.min(100.0, (crossAssetAtrPct - crossAssetAtrLow) / (crossAssetAtrHigh - crossAssetAtrLow) * 100.0)) : 50.0
+compressionBasis = ta.sma(close, 40)
+compressionDev = ta.stdev(close, 40)
+compressionWidth = compressionBasis != 0 ? compressionDev * 4.0 / compressionBasis * 100.0 : 0.0
+compressionLow = ta.lowest(compressionWidth, 120)
+compressionHigh = ta.highest(compressionWidth, 120)
+compressionScore = compressionHigh > compressionLow ? math.max(0.0, math.min(100.0, (compressionWidth - compressionLow) / (compressionHigh - compressionLow) * 100.0)) : 50.0
+distanceToMidPct = midMid != 0 ? (close - midMid) / midMid * 100.0 : 0.0
+channelSpanPct = midMid != 0 ? (overbought - oversold) / midMid * 100.0 : 0.0
+volRegime = crossAssetAtrRank >= 80 ? "High Volatility" : crossAssetAtrRank <= 24 ? "Low Volatility" : "Normal Volatility"
+
+channelPosition = overbought != oversold ? f_clamp((close - oversold) / (overbought - oversold) * 100.0, 0.0, 100.0) : 50.0
+midlineCrossRate = ta.sma(ta.cross(close, midMid) ? 1.0 : 0.0, 20) * 100.0
+channelSlopePct = not na(midMid[5]) and midMid[5] != 0 ? (midMid - midMid[5]) / midMid[5] * 100.0 : 0.0
+volumePressure = isVolume ? (close >= open ? 1.0 : -1.0) * crossAssetVolumeWeight : 0.0
+momentumSource = not na(close[momentumLength]) and close[momentumLength] != 0 ? (close - close[momentumLength]) / close[momentumLength] * 100.0 : 0.0
+cryptoPremiumProxy = cryptoPremiumWeight > 0 and close != 0 ? f_clamp((hlc3 - ta.vwap(hlc3)) / close * 100.0, -3.0, 3.0) * cryptoPremiumWeight : 0.0
+
+trendModeScore = f_clamp(adx / math.max(adxThresh, 1) * 50.0 + math.abs(channelSlopePct) * 420.0 + math.abs(distanceToMidPct) * 2.4, 0.0, 100.0)
+rangeModeScore = f_clamp(100.0 - trendModeScore + midlineCrossRate * 0.35 - compressionScore * 0.18, 0.0, 100.0)
+probabilityMode = trendModeScore >= rangeModeScore ? "Trend Mode" : "Range Mode"
+
+positionScoreTrend = close >= midMid ? f_clamp((channelPosition - 50.0) * 1.12, -40.0, 40.0) : f_clamp((channelPosition - 50.0) * 1.12, -40.0, 40.0)
+positionScoreRange = channelPosition <= 24 ? 26.0 : channelPosition >= 76 ? -26.0 : (channelPosition - 50.0) * 0.32
+slopeScore = f_clamp(channelSlopePct * 900.0, -22.0, 22.0)
+dmiScore = f_clamp((diPlus - diMinus) * 0.52, -18.0, 18.0)
+adxScore = isTrend ? (close >= midMid ? 8.0 : -8.0) : 0.0
+atrScore = crossAssetAtrRank >= 80 ? (close >= open ? 4.0 : -4.0) : crossAssetAtrRank <= 24 ? 0.0 : (close >= midMid ? 2.0 : -2.0)
+compressionScoreBias = compressionScore <= 24 ? (close >= midMid ? 5.0 : -5.0) : 0.0
+volumeScore = f_clamp(volumePressure * 12.0, -12.0, 12.0)
+momentumScore = f_clamp(momentumSource * 3.0, -16.0, 16.0)
+premiumScore = f_clamp(cryptoPremiumProxy * 5.0, -10.0, 10.0)
+
+trendProbabilityRaw = 50.0 + (positionScoreTrend * 0.34 + slopeScore * 0.20 + dmiScore * 0.18 + adxScore + atrScore + volumeScore * 0.60 + momentumScore * 0.50 + premiumScore) * probabilityProfileWeight
+rangeProbabilityRaw = 50.0 + (positionScoreRange * 0.48 + compressionScoreBias + volumeScore * 0.45 + momentumScore * 0.34 + dmiScore * 0.12 + premiumScore * 0.70) * probabilityProfileWeight
+probabilityRawSelected = probabilityMode == "Trend Mode" ? trendProbabilityRaw : rangeProbabilityRaw
+upProbability = f_clamp(nz(probabilityRawSelected, 50.0), 1.0, 99.0)
+downProbability = 100.0 - upProbability
+dominantBias = upProbability >= 57 ? "Up Bias" : downProbability >= 57 ? "Down Bias" : "Neutral"
+cryptoSignalConfidenceRaw = math.abs(upProbability - 50.0) * 2.0 + nz(adx, 0.0) * 0.35 + nz(crossAssetAtrRank, 50.0) * 0.18 + math.abs(nz(channelSlopePct, 0.0)) * 650.0
+float confidenceSlopeWeight = 180.0
+float confidenceSlopeCap = 30.0
+if (assetProfile == "Futures/CFD")
+    confidenceSlopeWeight := 360.0
+    confidenceSlopeCap := 45.0
+else if (assetProfile == "FX")
+    confidenceSlopeWeight := 120.0
+    confidenceSlopeCap := 24.0
+else if (assetProfile == "Bond/Rates")
+    confidenceSlopeWeight := 100.0
+    confidenceSlopeCap := 22.0
+else if (assetProfile == "Fund")
+    confidenceSlopeWeight := 90.0
+    confidenceSlopeCap := 20.0
+
+confidenceProbabilityComponent = f_clamp(math.abs(upProbability - 50.0) * 1.10, 0.0, 35.0)
+confidenceAdxComponent = f_clamp(nz(adx, 0.0) / math.max(adxThresh, 1) * 12.0, 0.0, 18.0)
+confidenceVolComponent = f_clamp(nz(crossAssetAtrRank, 50.0) * 0.10, 0.0, 10.0)
+confidenceSlopeComponent = f_clamp(math.abs(nz(channelSlopePct, 0.0)) * confidenceSlopeWeight, 0.0, confidenceSlopeCap)
+profileSignalConfidenceRaw = 25.0 + confidenceProbabilityComponent + confidenceAdxComponent + confidenceVolComponent + confidenceSlopeComponent
+signalConfidenceRaw = assetProfile == "Crypto" ? cryptoSignalConfidenceRaw : profileSignalConfidenceRaw
+signalConfidence = f_clamp(nz(signalConfidenceRaw, 0.0), 0.0, 100.0)
+
+demandShock = isVolume and close > open and low <= blueLower and close > blueMid
+supplyShock = isVolume and close < open and high >= orangeUpper and close < orangeMid
+marketStateRaw = demandShock ? "Demand Shock" :
+                 supplyShock ? "Supply Shock" :
+                 compressionScore <= 24 and crossAssetAtrRank < 75 ? "Compression" :
+                 crossAssetAtrRank >= 80 and not isTrend ? "High Volatility" :
+                 isTrend and uptrend ? "Trend Up" :
+                 isTrend and downtrend ? "Trend Down" :
+                 upProbability >= downProbability ? "Range Bullish" :
+                 "Range Bearish"
+var string marketStateStable = "Range Bullish"
+sameRawState = marketStateRaw == marketStateRaw[1]
+marketStateStable := sameRawState or demandShock or supplyShock ? marketStateRaw : na(marketStateStable[1]) ? marketStateRaw : marketStateStable[1]
+marketState = marketStateStable
+
+stateChanged = marketState != marketState[1]
+touchOuterBand = high >= overbought or low <= oversold
+returnToMid = ta.cross(close, midMid)
+midlineReclaim = ta.crossover(close, midMid)
+midlineLoss = ta.crossunder(close, midMid)
+orangeVolumeReaction = isVolume and close < open and high >= orangeMid
+blueVolumeReaction = isVolume and close > open and low <= blueMid
+compressionBreakout = marketState[1] == "Compression" and marketState != "Compression" and (close > orangeUpper or close < blueLower)
+strongTrendConfirm = (marketState == "Trend Up" and ta.crossover(close, midUpper)) or (marketState == "Trend Down" and ta.crossunder(close, midLower))
+probabilityFlipBull = ta.crossover(upProbability, downProbability)
+probabilityFlipBear = ta.crossunder(upProbability, downProbability)
+
+enterLong1 = blueVolumeReaction and upProbability > 52
+enterLong2 = ta.crossover(close, blueUpper) and upProbability > 55
+enterLong3 = ta.crossover(close, midMid) and upProbability > 58
+enterShort1 = orangeVolumeReaction and downProbability > 52
+enterShort2 = ta.crossunder(close, orangeLower) and downProbability > 55
+enterShort3 = ta.crossunder(close, midMid) and downProbability > 58
+trendLong = marketState == "Trend Up" and close > midUpper and upProbability > 60
+trendShort = marketState == "Trend Down" and close < midLower and downProbability > 60
+longTP = high >= orangeUpper and upProbability < upProbability[1]
+shortTP = low <= blueLower and downProbability < downProbability[1]
+allLongExit = ta.crossunder(close, midMid) or probabilityFlipBear
+allShortExit = ta.crossover(close, midMid) or probabilityFlipBull
+longReferenceRaw = enterLong1 or enterLong2 or enterLong3 or trendLong
+shortReferenceRaw = enterShort1 or enterShort2 or enterShort3 or trendShort
+longExitRaw = longTP or allLongExit
+shortExitRaw = shortTP or allShortExit
+
+alertFilterOff = alertQualityFilter == "Off"
+alertFilterStrict = alertQualityFilter == "Strict"
+alertConfidenceLoose = alertFilterStrict ? 65.0 : 50.0
+alertConfidenceNormal = alertFilterStrict ? 75.0 : 60.0
+alertConfidenceStrong = alertFilterStrict ? 85.0 : 70.0
+alertProbabilityGapLoose = alertFilterStrict ? 18.0 : 10.0
+alertProbabilityGapNormal = alertFilterStrict ? 26.0 : 16.0
+alertProbabilityGapStrong = alertFilterStrict ? 34.0 : 22.0
+alertProbabilityGap = math.abs(upProbability - downProbability)
+alertBullBiasNormal = upProbability > downProbability and alertProbabilityGap >= alertProbabilityGapNormal
+alertBearBiasNormal = downProbability > upProbability and alertProbabilityGap >= alertProbabilityGapNormal
+alertBullBiasStrong = upProbability > downProbability and alertProbabilityGap >= alertProbabilityGapStrong
+alertBearBiasStrong = downProbability > upProbability and alertProbabilityGap >= alertProbabilityGapStrong
+alertLooseQuality = signalConfidence >= alertConfidenceLoose or alertProbabilityGap >= alertProbabilityGapLoose
+alertNormalQuality = signalConfidence >= alertConfidenceNormal or alertProbabilityGap >= alertProbabilityGapNormal
+alertStrongQuality = signalConfidence >= alertConfidenceStrong or alertProbabilityGap >= alertProbabilityGapStrong
+
+alertStateChanged = alertFilterOff ? stateChanged : stateChanged and alertLooseQuality
+alertMidlineReclaim = alertFilterOff ? midlineReclaim : midlineReclaim and signalConfidence >= alertConfidenceNormal and alertBullBiasNormal
+alertMidlineLoss = alertFilterOff ? midlineLoss : midlineLoss and signalConfidence >= alertConfidenceNormal and alertBearBiasNormal
+alertTouchOuterBand = alertFilterOff ? touchOuterBand : touchOuterBand and alertStrongQuality
+alertOrangeVolumeReaction = alertFilterOff ? orangeVolumeReaction : orangeVolumeReaction and signalConfidence >= alertConfidenceNormal and alertBearBiasNormal
+alertBlueVolumeReaction = alertFilterOff ? blueVolumeReaction : blueVolumeReaction and signalConfidence >= alertConfidenceNormal and alertBullBiasNormal
+alertCompressionBreakout = alertFilterOff ? compressionBreakout : compressionBreakout and alertLooseQuality
+alertStrongTrendConfirm = alertFilterOff ? strongTrendConfirm : strongTrendConfirm and alertNormalQuality
+alertProbabilityFlipBull = alertFilterOff ? probabilityFlipBull : probabilityFlipBull and signalConfidence >= alertConfidenceLoose and alertBullBiasNormal
+alertProbabilityFlipBear = alertFilterOff ? probabilityFlipBear : probabilityFlipBear and signalConfidence >= alertConfidenceLoose and alertBearBiasNormal
+alertLongReference = alertFilterOff ? longReferenceRaw : longReferenceRaw and signalConfidence >= alertConfidenceStrong and alertBullBiasStrong
+alertShortReference = alertFilterOff ? shortReferenceRaw : shortReferenceRaw and signalConfidence >= alertConfidenceStrong and alertBearBiasStrong
+alertLongExit = alertFilterOff ? longExitRaw : longExitRaw and alertNormalQuality
+alertShortExit = alertFilterOff ? shortExitRaw : shortExitRaw and alertNormalQuality
+
+// === Alerts and visuals ===
+alertcondition(alertStateChanged, "ASRVC State Change", "ASRVC market state changed.")
+alertcondition(alertMidlineReclaim, "ASRVC Midline Reclaim", "Price reclaimed the ASRVC midline.")
+alertcondition(alertMidlineLoss, "ASRVC Midline Loss", "Price lost the ASRVC midline.")
+alertcondition(alertTouchOuterBand, "ASRVC Outer Band Touch", "Price touched an ASRVC outer band.")
+alertcondition(alertOrangeVolumeReaction, "ASRVC Orange Volume Reaction", "Volume reaction appeared near the ASRVC orange zone.")
+alertcondition(alertBlueVolumeReaction, "ASRVC Blue Volume Reaction", "Volume reaction appeared near the ASRVC blue zone.")
+alertcondition(alertCompressionBreakout, "ASRVC Compression Breakout", "ASRVC compression released into a breakout.")
+alertcondition(alertStrongTrendConfirm, "ASRVC Strong Trend Confirmed", "ASRVC confirmed a strong trend continuation.")
+alertcondition(alertProbabilityFlipBull, "ASRVC Probability Flip Bull", "ASRVC probability flipped toward upside bias.")
+alertcondition(alertProbabilityFlipBear, "ASRVC Probability Flip Bear", "ASRVC probability flipped toward downside bias.")
+alertcondition(alertLongReference, "ASRVC Long Reference Levels", "ASRVC long-side reference condition appeared.")
+alertcondition(alertShortReference, "ASRVC Short Reference Levels", "ASRVC short-side reference condition appeared.")
+alertcondition(alertLongExit, "ASRVC Long Exit Reference", "ASRVC long-side take-profit or exit reference appeared.")
+alertcondition(alertShortExit, "ASRVC Short Exit Reference", "ASRVC short-side take-profit or exit reference appeared.")
+
+// 颜色设置
+trendBrightGreen = color.rgb(20, 225, 20)   // 趋势中的绿色（更亮）
+trendBrightRed = color.rgb(225, 20, 20)     // 趋势中的红色（更亮）
+normalGray = color.rgb(160, 160, 160)       // 震荡中的灰色
+
+// 增强区域中线颜色
+orangeMidColor = color.rgb(255, 165, 0)     // 更亮的橙色中线
+blueMidColor = color.rgb(30, 144, 255)       // 更亮的蓝色中线
+
+// 颜色
+bullColor = color.rgb(38, 166, 154)  // 绿色/多头颜色
+bearColor = color.rgb(240, 83, 80)   // 红色/空头颜色
+midLineColor = marketState == "Trend Up" or marketState == "Demand Shock" or marketState == "Range Bullish" ? trendBrightGreen :
+               marketState == "Trend Down" or marketState == "Supply Shock" or marketState == "Range Bearish" ? trendBrightRed :
+               marketState == "Compression" ? blueMidColor :
+               normalGray
+
+//==============================================================================
+// 其他计算变量 (Other Calculations)
+//==============================================================================
+// 通道计算相关变量已在前面定义
+
+// 绘制通道并存储绘图对象 - 调整绘制顺序以确保线条正确显示
+// 从最外层到最内层绘制，保证图形层级正确
+p_overbought = plot(overbought, "超买线", color.new(color.red, 0), 2, plot.style_line, display = display.all)
+p_orangeUpper = plot(orangeUpper, "橙色上轨", color.new(color.orange, 40), 1, plot.style_line, display = display.all)  
+p_orangeMid = plot(orangeMid, "橙色中轨", orangeMidColor, 2, plot.style_line, display = display.all)                  
+p_orangeLower = plot(orangeLower, "橙色下轨", color.new(color.orange, 40), 1, plot.style_line, display = display.all)   
+p_midUpper = plot(midUpper, "中间上轨", color.new(color.white, 40), 1, plot.style_line, display = display.all)         
+p_midLine = plot(midMid, "中轨线", midLineColor, 3, plot.style_line, display = display.all)                            
+p_midLower = plot(midLower, "中间下轨", color.new(color.white, 40), 1, plot.style_line, display = display.all)          
+p_blueUpper = plot(blueUpper, "蓝色上轨", color.new(color.blue, 40), 1, plot.style_line, display = display.all)         
+p_blueMid = plot(blueMid, "蓝色中轨", blueMidColor, 2, plot.style_line, display = display.all)                         
+p_blueLower = plot(blueLower, "蓝色下轨", color.new(color.blue, 40), 1, plot.style_line, display = display.all)         
+p_oversold = plot(oversold, "超卖线", color.new(color.green, 0), 2, plot.style_line, display = display.all)
+
+// 修改区域填充逻辑 - 保持视觉层级分明
+fill(p_orangeUpper, p_orangeMid, cleanMode ? na : color.new(color.orange, 70), "橙色区域上部")
+fill(p_orangeMid, p_orangeLower, cleanMode ? na : color.new(color.orange, 70), "橙色区域下部")     
+
+// 中间区域填充逻辑
+fill(p_midUpper, p_midLine, 
+     cleanMode ? na : isTrend and uptrend ? color.new(bullColor, 60) : color.new(color.white, 80), 
+     "上中间区域")
+     
+fill(p_midLine, p_midLower, 
+     cleanMode ? na : isTrend and downtrend ? color.new(bearColor, 60) : color.new(color.white, 80), 
+     "下中间区域")
+     
+// 蓝色区域填充逻辑
+fill(p_blueUpper, p_blueMid, cleanMode ? na : color.new(color.blue, 70), "蓝色区域上部")
+fill(p_blueMid, p_blueLower, cleanMode ? na : color.new(color.blue, 70), "蓝色区域下部")
+
+// 显示当前价格线对应的各通道值
+// === Information panel ===
+panelPosition = switch panelPositionInput
+    "Bottom Right" => position.bottom_right
+    "Top Left" => position.top_left
+    "Top Right" => position.top_right
+    => position.bottom_left
+
+var table priceTable = table.new(panelPosition, 2, 15, color.rgb(27, 29, 35, 85), border_width=1, border_color=color.rgb(50, 54, 60))
+
+// 定义美化显示框所需的颜色
+var color neutralColor = color.rgb(180, 180, 200)  // 中性颜色
+var color valueColor = color.white               // 数值颜色
+var color headerBgColor = color.rgb(40, 44, 52)    // 标题背景颜色
+var color titleColor = color.rgb(255, 200, 100)    // 标题文字颜色
+var color subTitleColor = color.rgb(140, 200, 255) // 子标题颜色
+var color sectionBg1 = color.rgb(35, 37, 45, 85)  // 区块背景色1
+var color sectionBg2 = color.rgb(40, 42, 50, 85)  // 区块背景色2
+
+if (barstate.islast)
+    // 计算当前价格与各通道的距离百分比
+    float priceDistToMid = ((close - midMid) / midMid) * 100
+    
+    // 获取当前K线位置
+    string pricePosition = ""
+    if (close > orangeUpper)
+        pricePosition := "超买区域"
+    else if (close > orangeMid)
+        pricePosition := "橙色上区"
+    else if (close > orangeLower)
+        pricePosition := "橙色中区"
+    else if (close > midUpper)
+        pricePosition := "橙色下区"
+    else if (close > midMid)
+        pricePosition := "上中性区"
+    else if (close > midLower)
+        pricePosition := "下中性区"
+    else if (close > blueUpper)
+        pricePosition := "蓝色上区"
+    else if (close > blueMid)
+        pricePosition := "蓝色中区"
+    else if (close > blueLower)
+        pricePosition := "蓝色下区"
+    else
+        pricePosition := "超卖区域"
+    
+    // 计算当前成交量相对于平均的百分比
+    float vol_ratio = volumeAvailable ? (volume / avgVol) * 100 : 0
+    
+    // 计算到下一个关键支撑位的距离
+    float dist_to_support = 0.0
+    if (close > midMid)
+        dist_to_support := ((close - midMid) / close) * 100
+    else if (close > midLower)
+        dist_to_support := ((close - midLower) / close) * 100
+    else if (close > blueUpper)
+        dist_to_support := ((close - blueUpper) / close) * 100
+    else if (close > blueMid)
+        dist_to_support := ((close - blueMid) / close) * 100
+    else if (close > blueLower)
+        dist_to_support := ((close - oversold) / close) * 100
+    
+    // 计算到下一个关键阻力位的距离
+    float dist_to_resistance = 0.0
+    if (close < midMid)
+        dist_to_resistance := ((midMid - close) / close) * 100
+    else if (close < midUpper)
+        dist_to_resistance := ((midUpper - close) / close) * 100
+    else if (close < orangeLower)
+        dist_to_resistance := ((orangeLower - close) / close) * 100
+    else if (close < orangeMid)
+        dist_to_resistance := ((orangeMid - close) / close) * 100
+    else if (close < orangeUpper)
+        dist_to_resistance := ((orangeUpper - close) / close) * 100
+    else
+        dist_to_resistance := ((overbought - close) / close) * 100
+    
+    // 计算价格动量 - 比较当前价格与N个周期前的价格
+    float momentumBase = not na(close[momentumLength]) and close[momentumLength] != 0 ? close[momentumLength] : close
+    float momentum = momentumBase != 0 ? ((close - momentumBase) / momentumBase) * 100 : 0.0
+    string momentum_str = momentum > 0 ? "↗ 上升 +" + str.tostring(momentum, "#.2") + "%" : 
+                          "↘ 下降 " + str.tostring(momentum, "#.2") + "%"
+    
+    // 确定当前趋势状态
+    trend_status = marketState
+    
+    // 构建布尔字段，用于判断是否放量
+    string vol_status = volumeAvailable ? (isVolume ? "✓ 放量" : "✗ 无放量") : "Volume N/A"
+    
+    // 根据价格位置和趋势生成交易信号
+    string tradeSignal = ""
+    color signalColor = neutralColor
+    
+    if (showTradeSignals)
+        if (close > orangeUpper)
+            tradeSignal := "Reference: upper extension / watch reaction"
+            signalColor := bearColor
+        else if (close > orangeMid and adx > adxThresh)
+            tradeSignal := "Reference: trend-side strength zone"
+            signalColor := bullColor
+        else if (close > orangeMid)
+            tradeSignal := "Reference: orange zone rotation"
+            signalColor := bullColor
+        else if (close > midUpper and adx > adxThresh)
+            tradeSignal := "Reference: TrendLong structure"
+            signalColor := bullColor
+        else if (close > midUpper)
+            tradeSignal := "Reference: above-mid bullish structure"
+            signalColor := bullColor
+        else if (close < blueLower)
+            tradeSignal := "Reference: lower extension / watch reaction"
+            signalColor := bullColor
+        else if (close < blueMid and adx > adxThresh)
+            tradeSignal := "Reference: trend-side weakness zone"
+            signalColor := bearColor
+        else if (close < blueMid)
+            tradeSignal := "Reference: blue zone rotation"
+            signalColor := bearColor
+        else if (close < midLower and adx > adxThresh)
+            tradeSignal := "Reference: TrendShort structure"
+            signalColor := bearColor
+        else if (close < midLower)
+            tradeSignal := "Reference: below-mid bearish structure"
+            signalColor := bearColor
+        else
+            tradeSignal := "Reference: neutral middle structure"
+    
+    // 计算日内波动率
+    float dayHigh = ta.highest(high, 24) // 假设日内数据
+    float dayLow = ta.lowest(low, 24)
+    float dayRange = ((dayHigh - dayLow) / close) * 100
+    dayRange := na(dayRange) ? 0.0 : dayRange
+    
+    // 计算价格变化百分比并防止NaN
+    float price_change_pct = open != 0 ? ((close - open) / open * 100) : 0.0
+    price_change_pct := na(price_change_pct) ? 0.0 : price_change_pct
+    
+    // 计算到下一个支撑位和阻力位的距离，确保没有NaN
+    dist_to_support := na(dist_to_support) ? 0.0 : dist_to_support
+    dist_to_resistance := na(dist_to_resistance) ? 0.0 : dist_to_resistance
+    
+    // 确保动量值有效
+    momentum := na(momentum) ? 0.0 : momentum
+    
+    // 确保价格距离中轨值有效
+    priceDistToMid := na(priceDistToMid) ? 0.0 : priceDistToMid
+    
+    string activeKernelText = "ASR General Kernel"
+    string highBetaProfileText = assetProfile
+    if (monthlyTrendExtensionEligible)
+        highBetaProfileText := "Monthly Trend Extension " + str.tostring(monthlyTrendExtensionScore * 100.0, "#.0")
+    else if (isWeeklyCryptoProfile)
+        highBetaProfileText := "Weekly Crypto Retune"
+    else if (isWeeklyEquityProfile)
+        highBetaProfileText := "Weekly Equity"
+        if (equityWeeklyExtensionScore >= 0.20)
+            highBetaProfileText := "Weekly High-Beta Equity " + str.tostring(equityWeeklyExtensionScore * 100.0, "#.0")
+    else if (equityDailyHighBetaScore >= 0.20)
+        highBetaProfileText := "Daily High-Beta Equity " + str.tostring(equityDailyHighBetaScore * 100.0, "#.0")
+    else if (equityExtensionScore >= 0.20)
+        highBetaProfileText := "High-Beta Extension " + str.tostring(equityExtensionScore * 100.0, "#.0")
+    else if (equityHighBetaScore >= 0.20)
+        highBetaProfileText := "High-Beta Equity " + str.tostring(equityHighBetaScore * 100.0, "#.0")
+    string profileText = highBetaProfileText + " / " + activeKernelText
+    string alertText = alertStateChanged ? "State Change" :
+                       alertProbabilityFlipBull ? "Probability Flip Up" :
+                       alertProbabilityFlipBear ? "Probability Flip Down" :
+                       alertCompressionBreakout ? "Compression Breakout" :
+                       alertStrongTrendConfirm ? "Trend Confirm" :
+                       alertTouchOuterBand ? "Outer Band Touch" :
+                       alertOrangeVolumeReaction ? "Orange Volume Reaction" :
+                       alertBlueVolumeReaction ? "Blue Volume Reaction" :
+                       alertMidlineReclaim ? "Midline Reclaim" :
+                       alertMidlineLoss ? "Midline Loss" :
+                       alertLongReference ? "Long Reference" :
+                       alertShortReference ? "Short Reference" :
+                       alertLongExit ? "Long Exit" :
+                       alertShortExit ? "Short Exit" :
+                       "No Trigger"
+
+    bool panelMini = tableMode == "Mini"
+    bool panelFull = tableMode == "Full"
+    int panelRow = 0
+    
+    // 清空表格
+    table.clear(priceTable, 0, 0, 1, 14)
+    
+    // 设置标题行 - 市场状态
+    string statusTitle = "Market State"
+    string statusValue = trend_status
+    table.cell(priceTable, 0, panelRow, statusTitle, bgcolor=headerBgColor, text_color=titleColor, text_size=size.normal)
+    table.cell(priceTable, 1, panelRow, statusValue, 
+               bgcolor=headerBgColor, 
+               text_color=trend_status == "Trend Up" or trend_status == "Demand Shock" or trend_status == "Range Bullish" ? bullColor :
+                         trend_status == "Trend Down" or trend_status == "Supply Shock" or trend_status == "Range Bearish" ? bearColor :
+                         trend_status == "High Volatility" ? color.orange :
+                         trend_status == "Compression" ? blueMidColor :
+                         neutralColor,
+               text_size=size.normal)
+    panelRow += 1
+    
+    // 价格信息区块
+    string priceLabel = "价格位置"
+    string priceValue = pricePosition
+    table.cell(priceTable, 0, panelRow, priceLabel, bgcolor=sectionBg1, text_color=subTitleColor)
+    table.cell(priceTable, 1, panelRow, priceValue, bgcolor=sectionBg1, text_color=close > midMid ? bullColor : bearColor)
+    panelRow += 1
+    
+    if (showProbabilityInfo)
+        table.cell(priceTable, 0, panelRow, "Up / Down Prob", bgcolor=sectionBg2, text_color=subTitleColor)
+        table.cell(priceTable, 1, panelRow, str.tostring(upProbability, "#.0") + "% / " + str.tostring(downProbability, "#.0") + "%", bgcolor=sectionBg2, text_color=upProbability >= downProbability ? bullColor : bearColor)
+        panelRow += 1
+
+        if (panelFull)
+            table.cell(priceTable, 0, panelRow, "Bias / Mode", bgcolor=sectionBg1, text_color=subTitleColor)
+            table.cell(priceTable, 1, panelRow, dominantBias + " / " + probabilityMode, bgcolor=sectionBg1, text_color=dominantBias == "Up Bias" ? bullColor : dominantBias == "Down Bias" ? bearColor : neutralColor, text_size=size.small)
+            panelRow += 1
+
+    table.cell(priceTable, 0, panelRow, "Confidence", bgcolor=sectionBg1, text_color=subTitleColor)
+    table.cell(priceTable, 1, panelRow, str.tostring(signalConfidence, "#.0") + "/100", bgcolor=sectionBg1, text_color=signalConfidence >= 50 ? bullColor : neutralColor)
+    panelRow += 1
+
+    if (not panelMini)
+        if (panelFull)
+            string indicatorLabels = "涨跌幅\n日内波动\n距中轨"
+            string indicatorValues = (close > open ? "🔼 " : "🔽 ") + str.tostring(price_change_pct, "#.2") + "%" + 
+                                     "\n" + str.tostring(dayRange, "#.2") + "%" + 
+                                     "\n" + (priceDistToMid > 0 ? "+" : "") + str.tostring(priceDistToMid, "#.2") + "%"
+            table.cell(priceTable, 0, panelRow, indicatorLabels, bgcolor=sectionBg2, text_color=subTitleColor)
+            table.cell(priceTable, 1, panelRow, indicatorValues, bgcolor=sectionBg2, text_color=valueColor)
+            panelRow += 1
+
+        string tradeLabels = panelFull ? "成交量\n下一支撑\n下一阻力" : "成交量"
+        string tradeValues = panelFull ? vol_status + " (" + str.tostring(vol_ratio, "#.0") + "%)" + "\n" + str.tostring(dist_to_support, "#.2") + "%" + "\n" + str.tostring(dist_to_resistance, "#.2") + "%" : vol_status + " (" + str.tostring(vol_ratio, "#.0") + "%)"
+        if (showMomentumInfo)
+            tradeLabels += "\n动量(" + str.tostring(momentumLength) + "期)"
+            tradeValues += "\n" + momentum_str
+        table.cell(priceTable, 0, panelRow, tradeLabels, bgcolor=sectionBg2, text_color=subTitleColor)
+        table.cell(priceTable, 1, panelRow, tradeValues, bgcolor=sectionBg2, text_color=valueColor)
+        panelRow += 1
+
+        if (showTradeSignals)
+            if (panelFull)
+                table.cell(priceTable, 0, panelRow, "📶 交易信号", bgcolor=headerBgColor, text_color=titleColor, text_size=size.normal)
+                table.cell(priceTable, 1, panelRow, "", bgcolor=headerBgColor)
+                panelRow += 1
+            table.cell(priceTable, 0, panelRow, "当前信号", bgcolor=sectionBg1, text_color=subTitleColor)
+            table.cell(priceTable, 1, panelRow, tradeSignal, bgcolor=sectionBg1, text_color=signalColor, text_size=size.small)
+            panelRow += 1
+
+        table.cell(priceTable, 0, panelRow, "Vol Regime", bgcolor=sectionBg2, text_color=subTitleColor)
+        table.cell(priceTable, 1, panelRow, volRegime + " / Rank " + str.tostring(crossAssetAtrRank, "#.0"), bgcolor=sectionBg2, text_color=valueColor, text_size=size.small)
+        panelRow += 1
+
+        table.cell(priceTable, 0, panelRow, "Channel Width", bgcolor=sectionBg1, text_color=subTitleColor)
+        table.cell(priceTable, 1, panelRow, str.tostring(channelSpanPct, "#.2") + "%", bgcolor=sectionBg1, text_color=valueColor)
+        panelRow += 1
+
+        if (panelFull)
+            table.cell(priceTable, 0, panelRow, "Asset Profile", bgcolor=sectionBg2, text_color=subTitleColor)
+            table.cell(priceTable, 1, panelRow, profileText, bgcolor=sectionBg2, text_color=valueColor, text_size=size.small)
+            panelRow += 1
+
+    table.cell(priceTable, 0, panelRow, "Alert Status", bgcolor=panelRow % 2 == 0 ? sectionBg2 : sectionBg1, text_color=subTitleColor)
+    table.cell(priceTable, 1, panelRow, alertText, bgcolor=panelRow % 2 == 0 ? sectionBg2 : sectionBg1, text_color=valueColor, text_size=size.small)
+
+    // 风险管理区块已移除
+
+// 确定K线颜色
+candleColor = close > open ? 
+              (isVolume ? highVolBullColor : normalBullColor) : 
+              (isVolume ? highVolBearColor : normalBearColor)
+
+// 绘制K线
+barcolor(showVolumeColor ? candleColor : na)
+
+// 移除平均成交量信息显示
+// 在图表上显示平均成交量信息
+// var label volInfo = label.new(bar_index, high, "", color = color.rgb(0, 0, 0, 100), style = label.style_label_down, textcolor = color.white)
+// if (barstate.islast and showVolumeColor)
+//     label.set_xy(volInfo, bar_index, high)
+//     label.set_text(volInfo, "平均成交量("+str.tostring(volPeriod)+"): " + str.tostring(avgVol, format.volume))
+//     label.set_tooltip(volInfo, "放量: >= " + str.tostring(volMultiplier) + "倍")
+// else if (barstate.islast and not showVolumeColor)
+//     label.delete(volInfo)

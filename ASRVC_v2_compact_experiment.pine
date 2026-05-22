@@ -1,0 +1,576 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//@version=6
+indicator("ASRVC v2 Cross-Asset", overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500, max_bars_back = 1500)
+
+//==============================================================================
+// Inputs
+//==============================================================================
+groupAsset = "资产配置"
+profileMode = input.string("Auto", "资产配置", options = ["Auto", "Crypto", "Equity/Index", "FX", "Bond/Rates", "Futures/CFD", "Fund", "Legacy BTC", "Legacy ETH"], tooltip = "Auto 会根据 syminfo.type 选择资产参数；Legacy 模式用于和旧版 BTC/ETH 风格做对照。", group = groupAsset)
+
+groupEngine = "通道引擎"
+baseLengthMode = input.string("Auto", "中轨周期模式", options = ["Auto", "Manual"], group = groupEngine)
+manualBaseLength = input.int(120, "手动中轨周期", minval = 20, maxval = 1500, group = groupEngine)
+useLinRegBlend = input.bool(true, "使用 EMA + LinReg 混合中轨", group = groupEngine)
+atrLen = input.int(14, "ATR 周期", minval = 5, maxval = 100, group = groupEngine)
+volatilityLookback = input.int(120, "波动率观察周期", minval = 40, maxval = 500, group = groupEngine)
+widthMultiplier = input.float(1.00, "通道宽度倍率", minval = 0.40, maxval = 2.50, step = 0.05, group = groupEngine)
+minWidthOverride = input.float(0.00, "最小宽度覆盖(%)", minval = 0.00, maxval = 20.00, step = 0.05, tooltip = "0 表示使用资产 profile 默认值。", group = groupEngine)
+maxWidthOverride = input.float(0.00, "最大宽度覆盖(%)", minval = 0.00, maxval = 80.00, step = 0.10, tooltip = "0 表示使用资产 profile 默认值。", group = groupEngine)
+
+groupState = "状态机"
+adxLen = input.int(14, "DMI 周期", minval = 5, maxval = 50, group = groupState)
+adxSmooth = input.int(14, "ADX 平滑", minval = 5, maxval = 50, group = groupState)
+adxThresh = input.float(25.0, "趋势 ADX 阈值", minval = 8.0, maxval = 60.0, step = 0.5, group = groupState)
+highVolRank = input.float(80.0, "高波动阈值", minval = 55.0, maxval = 98.0, step = 1.0, group = groupState)
+compressionRank = input.float(24.0, "压缩阈值", minval = 5.0, maxval = 45.0, step = 1.0, group = groupState)
+stateSensitivity = input.float(1.00, "状态机敏感度", minval = 0.50, maxval = 1.80, step = 0.05, group = groupState)
+
+groupSignals = "信号/警报"
+showTradeSignals = input.bool(true, "显示交易信号", group = groupSignals)
+showAlertsInfo = input.bool(true, "显示警报状态", group = groupSignals)
+signalConfidenceFloor = input.float(45.0, "信号信心下限", minval = 0.0, maxval = 100.0, step = 1.0, group = groupSignals)
+
+groupVolume = "量价分析"
+volPeriod = input.int(100, "量价周期", minval = 10, maxval = 1500, tooltip = "用于计算成交量均值和 z-score；无成交量市场会自动降权。", group = groupVolume)
+showVolumeColor = input.bool(true, "显示量价颜色", group = groupVolume)
+volMultiplier = input.float(2.0, "放量倍数", minval = 1.1, step = 0.1, group = groupVolume)
+
+groupDisplay = "显示设置"
+showSessionInfo = input.bool(true, "显示交易时段信息", group = groupDisplay)
+showMomentumInfo = input.bool(true, "显示动量信息", group = groupDisplay)
+momentumLength = input.int(10, "动量计算周期", minval = 5, maxval = 100, group = groupDisplay)
+showStateBackground = input.bool(false, "显示状态背景", group = groupDisplay)
+
+groupColors = "量价颜色"
+normalBullColor = input.color(color.rgb(30, 180, 30, 50), "普通上涨颜色", group = groupColors)
+normalBearColor = input.color(color.rgb(180, 30, 30, 50), "普通下跌颜色", group = groupColors)
+highVolBullColor = input.color(color.rgb(20, 255, 20, 0), "放量上涨", group = groupColors)
+highVolBearColor = input.color(color.rgb(255, 20, 20, 0), "放量下跌", group = groupColors)
+
+//==============================================================================
+// Helpers
+//==============================================================================
+f_clamp(float value, float minValue, float maxValue) =>
+    math.min(math.max(value, minValue), maxValue)
+
+f_safePercent(float numerator, float denominator) =>
+    denominator != 0.0 and not na(denominator) ? numerator / denominator * 100.0 : 0.0
+
+f_getProfile(string mode, string symbolType) =>
+    string resolved = mode
+    if mode == "Auto"
+        resolved := switch symbolType
+            "crypto" => "Crypto"
+            "spot" => "Crypto"
+            "swap" => "Crypto"
+            "stock" => "Equity/Index"
+            "index" => "Equity/Index"
+            "dr" => "Equity/Index"
+            "warrant" => "Equity/Index"
+            "right" => "Equity/Index"
+            "forex" => "FX"
+            "bond" => "Bond/Rates"
+            "futures" => "Futures/CFD"
+            "cfd" => "Futures/CFD"
+            "commodity" => "Futures/CFD"
+            "fund" => "Fund"
+            "structured" => "Fund"
+            => "Equity/Index"
+    resolved
+
+f_getBaseLength(string profile, float tfMinutes, string mode, int manualLength) =>
+    int autoLength = 120
+    if tfMinutes <= 3
+        autoLength := 420
+    else if tfMinutes <= 5
+        autoLength := 360
+    else if tfMinutes <= 15
+        autoLength := 240
+    else if tfMinutes <= 60
+        autoLength := 180
+    else if tfMinutes <= 240
+        autoLength := 120
+    else if tfMinutes <= 1440
+        autoLength := 100
+    else
+        autoLength := 52
+
+    float profileFactor = switch profile
+        "Crypto" => 1.00
+        "Equity/Index" => 1.10
+        "FX" => 1.25
+        "Bond/Rates" => 1.35
+        "Futures/CFD" => 1.05
+        "Fund" => 1.30
+        "Legacy BTC" => 0.90
+        "Legacy ETH" => 0.95
+        => 1.10
+
+    mode == "Manual" ? manualLength : int(f_clamp(math.round(autoLength * profileFactor), 20, 1500))
+
+f_getProfileAtrMult(string profile) =>
+    switch profile
+        "Crypto" => 4.40
+        "Equity/Index" => 3.10
+        "FX" => 2.30
+        "Bond/Rates" => 2.00
+        "Futures/CFD" => 3.00
+        "Fund" => 2.30
+        "Legacy BTC" => 3.80
+        "Legacy ETH" => 4.10
+        => 3.00
+
+f_getProfileMinWidth(string profile) =>
+    switch profile
+        "Crypto" => 1.80
+        "Equity/Index" => 1.10
+        "FX" => 0.35
+        "Bond/Rates" => 0.55
+        "Futures/CFD" => 0.80
+        "Fund" => 0.70
+        "Legacy BTC" => 1.60
+        "Legacy ETH" => 1.70
+        => 1.00
+
+f_getProfileMaxWidth(string profile) =>
+    switch profile
+        "Crypto" => 22.0
+        "Equity/Index" => 12.0
+        "FX" => 5.0
+        "Bond/Rates" => 7.0
+        "Futures/CFD" => 14.0
+        "Fund" => 9.0
+        "Legacy BTC" => 24.0
+        "Legacy ETH" => 26.0
+        => 12.0
+
+f_getVolumeWeight(string profile, bool volumeAvailable) =>
+    if not volumeAvailable
+        0.0
+    else
+        switch profile
+            "FX" => 0.20
+            "Bond/Rates" => 0.25
+            "Equity/Index" => 0.70
+            "Fund" => 0.45
+            => 1.00
+
+f_getVolatilityScore(float atrPct, float atrRank, float rangePct, float momentumAbs, float volumeZ, float volumeWeight) =>
+    float atrComponent = f_clamp(atrRank, 0.0, 100.0)
+    float rangeComponent = f_clamp(rangePct * 8.0, 0.0, 100.0)
+    float momentumComponent = f_clamp(momentumAbs * 10.0, 0.0, 100.0)
+    float volumeComponent = f_clamp((volumeZ + 2.0) * 25.0, 0.0, 100.0) * volumeWeight
+    float totalWeight = 0.45 + 0.25 + 0.20 + 0.10 * volumeWeight
+    (atrComponent * 0.45 + rangeComponent * 0.25 + momentumComponent * 0.20 + volumeComponent * 0.10) / totalWeight
+
+f_getMarketState(bool trendUp, bool trendDown, float adxValue, float adxThreshold, float volatilityRank, float compressionScore, float sensitivity, float highVolThresholdInput, float compressionThresholdInput) =>
+    float trendThreshold = adxThreshold / sensitivity
+    float highVolThreshold = highVolThresholdInput
+    float compressionThreshold = compressionThresholdInput
+    string state = "Range"
+    if compressionScore <= compressionThreshold and volatilityRank < highVolThreshold
+        state := "Compression"
+    else if volatilityRank >= highVolThreshold and adxValue < trendThreshold * 1.15
+        state := "High Volatility"
+    else if adxValue >= trendThreshold and trendUp
+        state := "Trend Up"
+    else if adxValue >= trendThreshold and trendDown
+        state := "Trend Down"
+    else if volatilityRank >= highVolThreshold
+        state := "High Volatility"
+    else
+        state := "Range"
+    state
+
+f_getChannelWidth(string profile, float atrPct, float volatilityRank, float trendScore, float momentumAbs, string marketState, float multiplier, float minOverride, float maxOverride) =>
+    float profileMult = f_getProfileAtrMult(profile)
+    float baseWidth = atrPct * profileMult
+    float rankBoost = 1.0 + (volatilityRank - 50.0) / 200.0
+    float trendBoost = 1.0 + f_clamp(trendScore, 0.0, 60.0) / 350.0
+    float momentumBoost = 1.0 + f_clamp(momentumAbs, 0.0, 10.0) / 80.0
+    float stateBoost = switch marketState
+        "Trend Up" => 1.05
+        "Trend Down" => 1.05
+        "Range" => 0.92
+        "High Volatility" => 1.22
+        "Compression" => 0.72
+        => 1.00
+    float minWidth = minOverride > 0 ? minOverride : f_getProfileMinWidth(profile)
+    float maxWidth = maxOverride > 0 ? maxOverride : f_getProfileMaxWidth(profile)
+    f_clamp(baseWidth * rankBoost * trendBoost * momentumBoost * stateBoost * multiplier, minWidth, maxWidth)
+
+f_buildChannelLevels(float mid, float widthPct, string profile) =>
+    float outer = widthPct / 100.0
+    float upperOuterRatio = profile == "Legacy ETH" ? 1.08 : profile == "Legacy BTC" ? 1.02 : 1.00
+    float lowerOuterRatio = profile == "Legacy ETH" ? 1.05 : profile == "Legacy BTC" ? 1.00 : 1.00
+    float overboughtLevel = mid * (1.0 + outer * upperOuterRatio)
+    float orangeUpperLevel = mid * (1.0 + outer * 0.660)
+    float orangeMidLevel = mid * (1.0 + outer * 0.500)
+    float orangeLowerLevel = mid * (1.0 + outer * 0.350)
+    float midUpperLevel = mid * (1.0 + outer * 0.220)
+    float midMidLevel = mid
+    float midLowerLevel = mid * (1.0 - outer * 0.220)
+    float blueUpperLevel = mid * (1.0 - outer * 0.350)
+    float blueMidLevel = mid * (1.0 - outer * 0.500)
+    float blueLowerLevel = mid * (1.0 - outer * 0.660)
+    float oversoldLevel = math.max(mid * (1.0 - outer * lowerOuterRatio), syminfo.mintick)
+    [overboughtLevel, orangeUpperLevel, orangeMidLevel, orangeLowerLevel, midUpperLevel, midMidLevel, midLowerLevel, blueUpperLevel, blueMidLevel, blueLowerLevel, oversoldLevel]
+
+f_getSignalText(string marketState, float price, float mid, float orangeUpperLevel, float orangeMidLevel, float midUpperLevel, float midLowerLevel, float blueMidLevel, float blueLowerLevel, float confidence, float confidenceFloor) =>
+    string signal = "中性: 等待状态机确认"
+    if confidence < confidenceFloor
+        signal := "低信心: 观望或降低仓位"
+    else if marketState == "Trend Up"
+        signal := price > orangeUpperLevel ? "趋势多头: 外轨过热，考虑减仓或跟踪止盈" : price > midUpperLevel ? "趋势多头: 回调守住中轨，可继续跟踪" : "趋势多头: 等待重新站上中轨"
+    else if marketState == "Trend Down"
+        signal := price < blueLowerLevel ? "趋势空头: 外轨过冷，考虑减仓或跟踪止盈" : price < midLowerLevel ? "趋势空头: 反弹未过中轨，可继续跟踪" : "趋势空头: 等待重新跌回中轨"
+    else if marketState == "Range"
+        signal := price > orangeMidLevel ? "震荡: 接近上沿，偏减仓/高抛" : price < blueMidLevel ? "震荡: 接近下沿，偏低吸/止盈空头" : "震荡: 中部区域，等待边界"
+    else if marketState == "High Volatility"
+        signal := "高波动: 降低信号权重，优先等收敛或确认"
+    else if marketState == "Compression"
+        signal := price > mid ? "压缩: 关注向上突破确认" : "压缩: 关注向下突破确认"
+    signal
+
+f_getStateColor(string marketState) =>
+    switch marketState
+        "Trend Up" => color.rgb(38, 166, 154)
+        "Trend Down" => color.rgb(240, 83, 80)
+        "Range" => color.rgb(180, 180, 200)
+        "High Volatility" => color.rgb(255, 165, 0)
+        "Compression" => color.rgb(140, 200, 255)
+        => color.rgb(180, 180, 200)
+
+f_pickBaseValue(int length, float v20, float v34, float v52, float v80, float v100, float v120, float v150, float v180, float v240, float v300, float v360, float v420, float v500, float v750, float v1000, float v1500) =>
+    length <= 20 ? v20 :
+     length <= 34 ? v34 :
+     length <= 52 ? v52 :
+     length <= 80 ? v80 :
+     length <= 100 ? v100 :
+     length <= 120 ? v120 :
+     length <= 150 ? v150 :
+     length <= 180 ? v180 :
+     length <= 240 ? v240 :
+     length <= 300 ? v300 :
+     length <= 360 ? v360 :
+     length <= 420 ? v420 :
+     length <= 500 ? v500 :
+     length <= 750 ? v750 :
+     length <= 1000 ? v1000 :
+     v1500
+
+f_pickStatsValue(int length, float v20, float v34, float v52, float v80, float v100, float v120, float v150, float v180, float v240, float v300, float v360, float v420, float v500) =>
+    length <= 20 ? v20 :
+     length <= 34 ? v34 :
+     length <= 52 ? v52 :
+     length <= 80 ? v80 :
+     length <= 100 ? v100 :
+     length <= 120 ? v120 :
+     length <= 150 ? v150 :
+     length <= 180 ? v180 :
+     length <= 240 ? v240 :
+     length <= 300 ? v300 :
+     length <= 360 ? v360 :
+     length <= 420 ? v420 :
+     v500
+
+//==============================================================================
+// Core calculations
+//==============================================================================
+float timeframeMinutes = timeframe.in_seconds() / 60.0
+string assetProfile = f_getProfile(profileMode, syminfo.type)
+int baseLength = f_getBaseLength(assetProfile, timeframeMinutes, baseLengthMode, manualBaseLength)
+
+float ema20 = ta.ema(close, 20)
+float ema34 = ta.ema(close, 34)
+float ema52 = ta.ema(close, 52)
+float ema80 = ta.ema(close, 80)
+float ema100 = ta.ema(close, 100)
+float ema120 = ta.ema(close, 120)
+float ema150 = ta.ema(close, 150)
+float ema180 = ta.ema(close, 180)
+float ema240 = ta.ema(close, 240)
+float ema300 = ta.ema(close, 300)
+float ema360 = ta.ema(close, 360)
+float ema420 = ta.ema(close, 420)
+float ema500 = ta.ema(close, 500)
+float ema750 = ta.ema(close, 750)
+float ema1000 = ta.ema(close, 1000)
+float ema1500 = ta.ema(close, 1500)
+float emaBase = f_pickBaseValue(baseLength, ema20, ema34, ema52, ema80, ema100, ema120, ema150, ema180, ema240, ema300, ema360, ema420, ema500, ema750, ema1000, ema1500)
+
+float linReg20 = ta.linreg(close, 20, 0)
+float linReg34 = ta.linreg(close, 34, 0)
+float linReg52 = ta.linreg(close, 52, 0)
+float linReg80 = ta.linreg(close, 80, 0)
+float linReg100 = ta.linreg(close, 100, 0)
+float linReg120 = ta.linreg(close, 120, 0)
+float linReg150 = ta.linreg(close, 150, 0)
+float linReg180 = ta.linreg(close, 180, 0)
+float linReg240 = ta.linreg(close, 240, 0)
+float linReg300 = ta.linreg(close, 300, 0)
+float linReg360 = ta.linreg(close, 360, 0)
+float linReg420 = ta.linreg(close, 420, 0)
+float linReg500 = ta.linreg(close, 500, 0)
+float linReg750 = ta.linreg(close, 750, 0)
+float linReg1000 = ta.linreg(close, 1000, 0)
+float linReg1500 = ta.linreg(close, 1500, 0)
+float linRegBase = f_pickBaseValue(baseLength, linReg20, linReg34, linReg52, linReg80, linReg100, linReg120, linReg150, linReg180, linReg240, linReg300, linReg360, linReg420, linReg500, linReg750, linReg1000, linReg1500)
+float blendWeight = useLinRegBlend ? 0.35 : 0.0
+float rawMid = emaBase * (1.0 - blendWeight) + linRegBase * blendWeight
+
+float atrValue = ta.atr(atrLen)
+float atrPct = f_safePercent(atrValue, close)
+float atrLow = ta.lowest(atrPct, volatilityLookback)
+float atrHigh = ta.highest(atrPct, volatilityLookback)
+float atrRank = atrHigh > atrLow ? f_clamp((atrPct - atrLow) / (atrHigh - atrLow) * 100.0, 0.0, 100.0) : 50.0
+int statsLength = math.min(baseLength, 500)
+
+float rangeHigh20 = ta.highest(high, 20)
+float rangeHigh34 = ta.highest(high, 34)
+float rangeHigh52 = ta.highest(high, 52)
+float rangeHigh80 = ta.highest(high, 80)
+float rangeHigh100 = ta.highest(high, 100)
+float rangeHigh120 = ta.highest(high, 120)
+float rangeHigh150 = ta.highest(high, 150)
+float rangeHigh180 = ta.highest(high, 180)
+float rangeHigh240 = ta.highest(high, 240)
+float rangeHigh300 = ta.highest(high, 300)
+float rangeHigh360 = ta.highest(high, 360)
+float rangeHigh420 = ta.highest(high, 420)
+float rangeHigh500 = ta.highest(high, 500)
+float rangeHigh = f_pickStatsValue(statsLength, rangeHigh20, rangeHigh34, rangeHigh52, rangeHigh80, rangeHigh100, rangeHigh120, rangeHigh150, rangeHigh180, rangeHigh240, rangeHigh300, rangeHigh360, rangeHigh420, rangeHigh500)
+
+float rangeLow20 = ta.lowest(low, 20)
+float rangeLow34 = ta.lowest(low, 34)
+float rangeLow52 = ta.lowest(low, 52)
+float rangeLow80 = ta.lowest(low, 80)
+float rangeLow100 = ta.lowest(low, 100)
+float rangeLow120 = ta.lowest(low, 120)
+float rangeLow150 = ta.lowest(low, 150)
+float rangeLow180 = ta.lowest(low, 180)
+float rangeLow240 = ta.lowest(low, 240)
+float rangeLow300 = ta.lowest(low, 300)
+float rangeLow360 = ta.lowest(low, 360)
+float rangeLow420 = ta.lowest(low, 420)
+float rangeLow500 = ta.lowest(low, 500)
+float rangeLow = f_pickStatsValue(statsLength, rangeLow20, rangeLow34, rangeLow52, rangeLow80, rangeLow100, rangeLow120, rangeLow150, rangeLow180, rangeLow240, rangeLow300, rangeLow360, rangeLow420, rangeLow500)
+
+float rangePct = f_safePercent(rangeHigh - rangeLow, close)
+float momentumPct = f_safePercent(close - close[momentumLength], close[momentumLength])
+float momentumAbs = math.abs(momentumPct)
+
+float avgVol = ta.sma(volume, volPeriod)
+float volStdev = ta.stdev(volume, volPeriod)
+bool volumeAvailable = not na(volume) and volume > 0 and not na(avgVol) and avgVol > 0
+float volumeWeight = f_getVolumeWeight(assetProfile, volumeAvailable)
+float volZ = volumeAvailable and volStdev > 0 ? (volume - avgVol) / volStdev : 0.0
+bool isVolume = volumeAvailable and volume >= avgVol * volMultiplier
+
+[diPlus, diMinus, adx] = ta.dmi(adxLen, adxSmooth)
+bool rawTrendUp = close >= rawMid and diPlus >= diMinus
+bool rawTrendDown = close < rawMid and diMinus > diPlus
+
+float sma20 = ta.sma(close, 20)
+float sma34 = ta.sma(close, 34)
+float sma52 = ta.sma(close, 52)
+float sma80 = ta.sma(close, 80)
+float sma100 = ta.sma(close, 100)
+float sma120 = ta.sma(close, 120)
+float sma150 = ta.sma(close, 150)
+float sma180 = ta.sma(close, 180)
+float sma240 = ta.sma(close, 240)
+float sma300 = ta.sma(close, 300)
+float sma360 = ta.sma(close, 360)
+float sma420 = ta.sma(close, 420)
+float sma500 = ta.sma(close, 500)
+float bbMid = f_pickStatsValue(statsLength, sma20, sma34, sma52, sma80, sma100, sma120, sma150, sma180, sma240, sma300, sma360, sma420, sma500)
+
+float stdev20 = ta.stdev(close, 20)
+float stdev34 = ta.stdev(close, 34)
+float stdev52 = ta.stdev(close, 52)
+float stdev80 = ta.stdev(close, 80)
+float stdev100 = ta.stdev(close, 100)
+float stdev120 = ta.stdev(close, 120)
+float stdev150 = ta.stdev(close, 150)
+float stdev180 = ta.stdev(close, 180)
+float stdev240 = ta.stdev(close, 240)
+float stdev300 = ta.stdev(close, 300)
+float stdev360 = ta.stdev(close, 360)
+float stdev420 = ta.stdev(close, 420)
+float stdev500 = ta.stdev(close, 500)
+float bbDev = f_pickStatsValue(statsLength, stdev20, stdev34, stdev52, stdev80, stdev100, stdev120, stdev150, stdev180, stdev240, stdev300, stdev360, stdev420, stdev500)
+float bbWidthPct = bbMid != 0 ? (bbDev * 4.0) / bbMid * 100.0 : 0.0
+float bbLow = ta.lowest(bbWidthPct, volatilityLookback)
+float bbHigh = ta.highest(bbWidthPct, volatilityLookback)
+float compressionScore = bbHigh > bbLow ? f_clamp((bbWidthPct - bbLow) / (bbHigh - bbLow) * 100.0, 0.0, 100.0) : 50.0
+
+float volatilityScore = f_getVolatilityScore(atrPct, atrRank, rangePct, momentumAbs, volZ, volumeWeight)
+string marketState = f_getMarketState(rawTrendUp, rawTrendDown, adx, adxThresh, atrRank, compressionScore, stateSensitivity, highVolRank, compressionRank)
+float trendScore = f_clamp(adx, 0.0, 100.0)
+float rawWidthPct = f_getChannelWidth(assetProfile, atrPct, atrRank, trendScore, momentumAbs, marketState, widthMultiplier, minWidthOverride, maxWidthOverride)
+
+float smoothAlpha = switch marketState
+    "Trend Up" => 0.18
+    "Trend Down" => 0.18
+    "Range" => 0.10
+    "High Volatility" => 0.24
+    "Compression" => 0.07
+    => 0.12
+smoothAlpha := f_clamp(smoothAlpha * (1.0 + atrRank / 300.0), 0.04, 0.35)
+
+var float smoothMid = na
+var float smoothWidthPct = na
+smoothMid := na(smoothMid[1]) ? rawMid : smoothMid[1] + smoothAlpha * (rawMid - smoothMid[1])
+smoothWidthPct := na(smoothWidthPct[1]) ? rawWidthPct : smoothWidthPct[1] + smoothAlpha * (rawWidthPct - smoothWidthPct[1])
+
+[overbought, orangeUpper, orangeMid, orangeLower, midUpper, midMid, midLower, blueUpper, blueMid, blueLower, oversold] = f_buildChannelLevels(smoothMid, smoothWidthPct, assetProfile)
+
+bool uptrend = close > midMid
+bool downtrend = close < midMid
+float channelSpan = overbought - oversold
+float priceLocation = channelSpan != 0 ? f_clamp((close - oversold) / channelSpan * 100.0, 0.0, 100.0) : 50.0
+float signalConfidence = f_clamp((trendScore * 0.45) + (math.abs(priceLocation - 50.0) * 0.75) + (volatilityScore * 0.25), 0.0, 100.0)
+string tradeSignal = showTradeSignals ? f_getSignalText(marketState, close, midMid, orangeUpper, orangeMid, midUpper, midLower, blueMid, blueLower, signalConfidence, signalConfidenceFloor) : ""
+
+//==============================================================================
+// Alerts
+//==============================================================================
+bool stateChanged = marketState != marketState[1]
+bool touchOuterBand = high >= overbought or low <= oversold
+bool returnToMid = ta.cross(close, midMid)
+bool compressionBreakout = marketState[1] == "Compression" and marketState != "Compression" and (close > orangeUpper or close < blueLower)
+bool strongTrendConfirm = (marketState == "Trend Up" and ta.crossover(close, midUpper)) or (marketState == "Trend Down" and ta.crossunder(close, midLower))
+
+alertcondition(stateChanged, "ASRVC State Change", "ASRVC market state changed.")
+alertcondition(touchOuterBand, "ASRVC Outer Band Touch", "Price touched an ASRVC outer band.")
+alertcondition(returnToMid, "ASRVC Midline Return", "Price crossed the ASRVC midline.")
+alertcondition(compressionBreakout, "ASRVC Compression Breakout", "ASRVC compression released into a breakout.")
+alertcondition(strongTrendConfirm, "ASRVC Strong Trend Confirmed", "ASRVC confirmed a strong trend continuation.")
+
+//==============================================================================
+// Plots
+//==============================================================================
+color bullColor = color.rgb(38, 166, 154)
+color bearColor = color.rgb(240, 83, 80)
+color neutralColor = color.rgb(180, 180, 200)
+color orangeMidColor = color.rgb(255, 165, 0)
+color blueMidColor = color.rgb(30, 144, 255)
+color stateColor = f_getStateColor(marketState)
+color midLineColor = marketState == "Trend Up" ? color.rgb(20, 225, 20) : marketState == "Trend Down" ? color.rgb(225, 20, 20) : marketState == "Compression" ? color.rgb(140, 200, 255) : neutralColor
+
+p_overbought = plot(overbought, "超买线", color.new(color.red, 0), 2, plot.style_line, display = display.all)
+p_orangeUpper = plot(orangeUpper, "橙色上轨", color.new(color.orange, 40), 1, plot.style_line, display = display.all)
+p_orangeMid = plot(orangeMid, "橙色中轨", orangeMidColor, 2, plot.style_line, display = display.all)
+p_orangeLower = plot(orangeLower, "橙色下轨", color.new(color.orange, 40), 1, plot.style_line, display = display.all)
+p_midUpper = plot(midUpper, "中间上轨", color.new(color.white, 40), 1, plot.style_line, display = display.all)
+p_midLine = plot(midMid, "中轨线", midLineColor, 3, plot.style_line, display = display.all)
+p_midLower = plot(midLower, "中间下轨", color.new(color.white, 40), 1, plot.style_line, display = display.all)
+p_blueUpper = plot(blueUpper, "蓝色上轨", color.new(color.blue, 40), 1, plot.style_line, display = display.all)
+p_blueMid = plot(blueMid, "蓝色中轨", blueMidColor, 2, plot.style_line, display = display.all)
+p_blueLower = plot(blueLower, "蓝色下轨", color.new(color.blue, 40), 1, plot.style_line, display = display.all)
+p_oversold = plot(oversold, "超卖线", color.new(color.green, 0), 2, plot.style_line, display = display.all)
+
+fill(p_orangeUpper, p_orangeMid, color.new(color.orange, 70), "橙色区域上部")
+fill(p_orangeMid, p_orangeLower, color.new(color.orange, 70), "橙色区域下部")
+fill(p_midUpper, p_midLine, marketState == "Trend Up" ? color.new(bullColor, 62) : color.new(color.white, 82), "上中间区域")
+fill(p_midLine, p_midLower, marketState == "Trend Down" ? color.new(bearColor, 62) : color.new(color.white, 82), "下中间区域")
+fill(p_blueUpper, p_blueMid, color.new(color.blue, 70), "蓝色区域上部")
+fill(p_blueMid, p_blueLower, color.new(color.blue, 70), "蓝色区域下部")
+
+bgcolor(showStateBackground ? color.new(stateColor, 92) : na)
+
+color candleColor = close > open ? (isVolume ? highVolBullColor : normalBullColor) : (isVolume ? highVolBearColor : normalBearColor)
+barcolor(showVolumeColor ? candleColor : na)
+
+//==============================================================================
+// Information panel
+//==============================================================================
+var table priceTable = table.new(position.bottom_left, 2, 13, color.rgb(27, 29, 35, 90), border_width = 1, border_color = color.rgb(50, 54, 60))
+
+f_pricePosition(float price) =>
+    string position = "中性区"
+    if price > orangeUpper
+        position := "超买区域"
+    else if price > orangeMid
+        position := "橙色上区"
+    else if price > orangeLower
+        position := "橙色中区"
+    else if price > midUpper
+        position := "橙色下区"
+    else if price > midMid
+        position := "上中性区"
+    else if price > midLower
+        position := "下中性区"
+    else if price > blueUpper
+        position := "蓝色上区"
+    else if price > blueMid
+        position := "蓝色中区"
+    else if price > blueLower
+        position := "蓝色下区"
+    else
+        position := "超卖区域"
+    position
+
+if barstate.islast
+    table.clear(priceTable, 0, 0, 1, 12)
+
+    color headerBgColor = color.rgb(40, 44, 52)
+    color sectionBg1 = color.rgb(35, 37, 45, 90)
+    color sectionBg2 = color.rgb(40, 42, 50, 90)
+    color titleColor = color.rgb(255, 200, 100)
+    color subTitleColor = color.rgb(140, 200, 255)
+    color valueColor = color.white
+
+    string trendStatus = marketState == "Trend Up" ? "上升趋势" : marketState == "Trend Down" ? "下降趋势" : marketState == "Range" ? "震荡行情" : marketState == "High Volatility" ? "高波动" : "压缩蓄势"
+    string volRegime = atrRank >= highVolRank ? "高波动" : atrRank <= compressionRank ? "低波动" : "正常波动"
+    string volumeStatus = volumeAvailable ? (isVolume ? "放量" : "正常") + " (" + str.tostring(volume / avgVol * 100.0, "#.0") + "%)" : "Volume N/A"
+    string sessionText = syminfo.session + " / " + syminfo.timezone
+    string pricePosition = f_pricePosition(close)
+    string momentumText = momentumPct > 0 ? "上升 +" + str.tostring(momentumPct, "#.2") + "%" : "下降 " + str.tostring(momentumPct, "#.2") + "%"
+    string alertText = showAlertsInfo ? (stateChanged ? "状态切换" : compressionBreakout ? "压缩突破" : strongTrendConfirm ? "趋势确认" : touchOuterBand ? "触及外轨" : returnToMid ? "回到中轨" : "无触发") : "关闭"
+    float distToMid = f_safePercent(close - midMid, midMid)
+
+    table.cell(priceTable, 0, 0, "ASRVC v2", bgcolor = headerBgColor, text_color = titleColor, text_size = size.normal)
+    table.cell(priceTable, 1, 0, syminfo.ticker + " / " + syminfo.type, bgcolor = headerBgColor, text_color = valueColor, text_size = size.normal)
+
+    table.cell(priceTable, 0, 1, "Asset Profile", bgcolor = sectionBg1, text_color = subTitleColor)
+    table.cell(priceTable, 1, 1, assetProfile, bgcolor = sectionBg1, text_color = valueColor)
+
+    table.cell(priceTable, 0, 2, "Market State", bgcolor = sectionBg2, text_color = subTitleColor)
+    table.cell(priceTable, 1, 2, trendStatus, bgcolor = sectionBg2, text_color = stateColor)
+
+    table.cell(priceTable, 0, 3, "Vol Regime", bgcolor = sectionBg1, text_color = subTitleColor)
+    table.cell(priceTable, 1, 3, volRegime + " / Rank " + str.tostring(atrRank, "#.0"), bgcolor = sectionBg1, text_color = valueColor)
+
+    table.cell(priceTable, 0, 4, "Signal Confidence", bgcolor = sectionBg2, text_color = subTitleColor)
+    table.cell(priceTable, 1, 4, str.tostring(signalConfidence, "#.0") + "/100", bgcolor = sectionBg2, text_color = signalConfidence >= signalConfidenceFloor ? stateColor : neutralColor)
+
+    table.cell(priceTable, 0, 5, "价格位置", bgcolor = sectionBg1, text_color = subTitleColor)
+    table.cell(priceTable, 1, 5, pricePosition, bgcolor = sectionBg1, text_color = uptrend ? bullColor : downtrend ? bearColor : neutralColor)
+
+    table.cell(priceTable, 0, 6, "通道宽度", bgcolor = sectionBg2, text_color = subTitleColor)
+    table.cell(priceTable, 1, 6, str.tostring(smoothWidthPct, "#.2") + "%", bgcolor = sectionBg2, text_color = valueColor)
+
+    table.cell(priceTable, 0, 7, "距中轨", bgcolor = sectionBg1, text_color = subTitleColor)
+    table.cell(priceTable, 1, 7, (distToMid > 0 ? "+" : "") + str.tostring(distToMid, "#.2") + "%", bgcolor = sectionBg1, text_color = distToMid >= 0 ? bullColor : bearColor)
+
+    table.cell(priceTable, 0, 8, "成交量", bgcolor = sectionBg2, text_color = subTitleColor)
+    table.cell(priceTable, 1, 8, volumeStatus, bgcolor = sectionBg2, text_color = isVolume ? stateColor : valueColor)
+
+    if showMomentumInfo
+        table.cell(priceTable, 0, 9, "动量", bgcolor = sectionBg1, text_color = subTitleColor)
+        table.cell(priceTable, 1, 9, momentumText, bgcolor = sectionBg1, text_color = momentumPct >= 0 ? bullColor : bearColor)
+
+    if showSessionInfo
+        table.cell(priceTable, 0, 10, "交易时段", bgcolor = sectionBg2, text_color = subTitleColor)
+        table.cell(priceTable, 1, 10, sessionText, bgcolor = sectionBg2, text_color = valueColor, text_size = size.small)
+
+    if showTradeSignals
+        table.cell(priceTable, 0, 11, "交易信号", bgcolor = sectionBg1, text_color = subTitleColor)
+        table.cell(priceTable, 1, 11, tradeSignal, bgcolor = sectionBg1, text_color = signalConfidence >= signalConfidenceFloor ? stateColor : neutralColor, text_size = size.small)
+
+    if showAlertsInfo
+        table.cell(priceTable, 0, 12, "警报状态", bgcolor = sectionBg2, text_color = subTitleColor)
+        table.cell(priceTable, 1, 12, alertText, bgcolor = sectionBg2, text_color = valueColor, text_size = size.small)
