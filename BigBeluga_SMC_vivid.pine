@@ -2,7 +2,7 @@
 // © BigBeluga
 //
 //@version=5
-indicator("BigBeluga - Smart Money Concepts", "BigBeluga - Smart Money Concepts [1.0.0 vivid3]", 
+indicator("BigBeluga - Smart Money Concepts", "BigBeluga - Smart Money Concepts [1.0.0 vivid4]", 
      overlay = true, 
      max_bars_back = 5000, 
      max_boxes_count = 500, 
@@ -39,7 +39,7 @@ bool showMapping    = input.bool(false, "Mapping Structure", inline="mapping", g
 string mappingStyle = input.string("----", "", options=["⎯⎯⎯⎯", "----"], inline="mapping", group=MSG)
 color mappingcss    = input.color(color.silver, "", tooltip="Display Mapping Structure", inline="mapping", group=MSG)
 bool candlecss      = input.bool(false, "Color Candles", tooltip=CST, group=MSG, inline="txt")
-string mstext       = input.string("Large", "", options=["Tiny", "Small", "Normal", "Large", "Huge"],
+string mstext       = input.string("Small", "", options=["Tiny", "Small", "Normal", "Large", "Huge"],
  inline="txt", group=MSG)
 string msmode       = input.string("Adjusted Points", "Algorithmic Logic", options=["Extreme Points", "Adjusted Points"]
  , inline="node", group=MSG)
@@ -63,7 +63,7 @@ obmode       = input.string("Length", "Construction", options=["Length", "Full"]
 len          = input.int(5, "", inline="atr", group=VBG, minval=1)
 obmiti       = input.string("Close", "Mitigation Method", options=["Close", "Wick", "Avg"], 
  tooltip="Mitigation method for when to trigger order blocks", group=VBG)
-obtxt        = input.string("Large", "Metric Size", options=["Tiny", "Small", "Normal", "Large", "Huge", "Auto"], 
+obtxt        = input.string("Normal", "Metric Size", options=["Tiny", "Small", "Normal", "Large", "Huge", "Auto"], 
  tooltip="Order block Metrics text size", inline="txt", group=VBG)
 showmetric   = input.bool(true, "Show Metrics", group=VBG)
 showline     = input.bool(true, "Show Mid-Line", group=VBG)
@@ -701,7 +701,7 @@ method display(ob id, ob[] full, int i) =>
                         bin.lb.unshift(label.new(
                                bar_index - 1
                              , ids.avg
-                             , textcolor = #ffffff
+                             , textcolor = color.new(#d1d4dc, 30)
                              , style     = label.style_label_left
                              , size      = obtxt.txSz()
                              , color     = #ffffff00
