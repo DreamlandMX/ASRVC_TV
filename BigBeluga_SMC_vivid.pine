@@ -2,7 +2,7 @@
 // © BigBeluga
 //
 //@version=5
-indicator("BigBeluga - Smart Money Concepts", "BigBeluga - Smart Money Concepts [1.0.0 vivid5]", 
+indicator("BigBeluga - Smart Money Concepts", "BigBeluga - Smart Money Concepts [1.0.0 vivid6]", 
      overlay = true, 
      max_bars_back = 5000, 
      max_boxes_count = 500, 
@@ -32,8 +32,8 @@ int mswindow        = input.int(5000, "", tooltip=MST,group=MSG, inline="kla", m
 bool showSwing      = input.bool(true, "Swing", inline="scss", group=MSG)
 int swingLimit      = input.int(100, "", tooltip=SLT, inline="scss", group=MSG, minval=10, maxval=200)
  
-color swingcssup    = input.color(#00a86b, "", inline="scss", group=MSG)
-color swingcssdn    = input.color(#e53935, "", inline="scss", group=MSG)
+color swingcssup    = input.color(#00e676, "", inline="scss", group=MSG)
+color swingcssdn    = input.color(#ff1744, "", inline="scss", group=MSG)
 
 bool showMapping    = input.bool(false, "Mapping Structure", inline="mapping", group=MSG)
 string mappingStyle = input.string("----", "", options=["⎯⎯⎯⎯", "----"], inline="mapping", group=MSG)
@@ -107,8 +107,8 @@ devfill      = input.bool(true, "Fill Area", group="Swing Failure Pattern")
 
 ehlshow      = input.bool(true, "Equal H&L", tooltip="Display EQH and EQL", inline="ehl", group="LIQUIDITY CONCEPTS")
 ehlmode      = input.string("Short-Term", "", options=["Short-Term", "Mid-Term", "Long-Term"], inline="ehl", group="LIQUIDITY CONCEPTS")
-ehldowncs    = input.color(#00a86b, "", inline="ehl", group="LIQUIDITY CONCEPTS")
-ehlupcs      = input.color(#e53935, "", inline="ehl", group="LIQUIDITY CONCEPTS")
+ehldowncs    = input.color(#00e676, "", inline="ehl", group="LIQUIDITY CONCEPTS")
+ehlupcs      = input.color(#ff1744, "", inline="ehl", group="LIQUIDITY CONCEPTS")
 liqprint     = input.bool(true, "Liquidity Prints", "Show Liquidity Grabs on the chart", inline="print", group="LIQUIDITY CONCEPTS")
 printupcs    = input.color(color.orange, "", inline="print", group="LIQUIDITY CONCEPTS")
 printdowncs  = input.color(color.blue, "", inline="print", group="LIQUIDITY CONCEPTS")
