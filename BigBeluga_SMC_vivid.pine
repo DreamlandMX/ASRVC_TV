@@ -2,7 +2,7 @@
 // © BigBeluga
 //
 //@version=5
-indicator("BigBeluga - Smart Money Concepts", "BigBeluga - Smart Money Concepts [1.0.0 vivid]", 
+indicator("BigBeluga - Smart Money Concepts", "BigBeluga - Smart Money Concepts [1.0.0 vivid2]", 
      overlay = true, 
      max_bars_back = 5000, 
      max_boxes_count = 500, 
@@ -39,7 +39,7 @@ bool showMapping    = input.bool(false, "Mapping Structure", inline="mapping", g
 string mappingStyle = input.string("----", "", options=["⎯⎯⎯⎯", "----"], inline="mapping", group=MSG)
 color mappingcss    = input.color(color.silver, "", tooltip="Display Mapping Structure", inline="mapping", group=MSG)
 bool candlecss      = input.bool(false, "Color Candles", tooltip=CST, group=MSG, inline="txt")
-string mstext       = input.string("Tiny", "", options=["Tiny", "Small", "Normal", "Large", "Huge"],
+string mstext       = input.string("Normal", "", options=["Tiny", "Small", "Normal", "Large", "Huge"],
  inline="txt", group=MSG)
 string msmode       = input.string("Adjusted Points", "Algorithmic Logic", options=["Extreme Points", "Adjusted Points"]
  , inline="node", group=MSG)
@@ -51,14 +51,14 @@ bool msbubble       = input.bool(true, "Bubbles", tooltip="Display Circle Bubble
 
 bool obshow         = input.bool(true, "Show Last", tooltip=OBD, group=VBG, inline="obshow")
 int oblast          = input.int(5, "", group=VBG, inline="obshow", minval=0)
-color obupcs       = input.color(color.new(#089981, 35), "", inline="obshow", group=VBG)
-color obdncs       = input.color(color.new(#f23645, 35), "", inline="obshow", group=VBG)
+color obupcs       = input.color(color.new(#089981, 15), "", inline="obshow", group=VBG)
+color obdncs       = input.color(color.new(#f23645, 15), "", inline="obshow", group=VBG)
 bool obshowactivity = input.bool(true, "Show Buy/Sell Activity", inline="act", group=VBG, tooltip=OBT)
-color obactup      = input.color(color.new(#089981, 25), "", inline="act", group=VBG)
-color obactdn      = input.color(color.new(#f23645, 25), "", inline="act", group=VBG)
+color obactup      = input.color(color.new(#089981, 10), "", inline="act", group=VBG)
+color obactdn      = input.color(color.new(#f23645, 10), "", inline="act", group=VBG)
 obshowbb     = input.bool(false, "Show Breakers", inline="bb", group=VBG, tooltip="Display Breakers")
-color bbup         = input.color(color.new(#089981, 70), "", inline="bb", group=VBG)
-color bbdn         = input.color(color.new(#f23645, 70), "", inline="bb", group=VBG)
+color bbup         = input.color(color.new(#089981, 40), "", inline="bb", group=VBG)
+color bbdn         = input.color(color.new(#f23645, 40), "", inline="bb", group=VBG)
 obmode       = input.string("Length", "Construction", options=["Length", "Full"], tooltip=OBMT, inline="atr", group=VBG)
 len          = input.int(5, "", inline="atr", group=VBG, minval=1)
 obmiti       = input.string("Close", "Mitigation Method", options=["Close", "Wick", "Avg"], 
@@ -74,10 +74,10 @@ fvg_enable   = input.bool(false, "", inline="1", group="FAIR VALUE GAP", tooltip
 what_fvg     = input.string("FVG", "", inline="1", group="FAIR VALUE GAP", tooltip="Display fair value gap", 
  options=["FVG", "Breakers"])
 fvg_num      = input.int(5, "Show Last", inline="1a", group="FAIR VALUE GAP", tooltip="Number of fvg to show", minval=0)
-fvg_upcss    = input.color(color.new(#089981, 40), "", inline="1", group="FAIR VALUE GAP")
-fvg_dncss    = input.color(color.new(#f23645, 40), "", inline="1", group="FAIR VALUE GAP")
-fvgbbup      = input.color(color.new(#089981, 70), "", inline="1", group="FAIR VALUE GAP")
-fvgbbdn      = input.color(color.new(#f23645, 70), "", inline="1", group="FAIR VALUE GAP")
+fvg_upcss    = input.color(color.new(#089981, 18), "", inline="1", group="FAIR VALUE GAP")
+fvg_dncss    = input.color(color.new(#f23645, 18), "", inline="1", group="FAIR VALUE GAP")
+fvgbbup      = input.color(color.new(#089981, 40), "", inline="1", group="FAIR VALUE GAP")
+fvgbbdn      = input.color(color.new(#f23645, 40), "", inline="1", group="FAIR VALUE GAP")
 fvg_src      = input.string("Close", "Mitigation", 
  inline="3", 
  group="FAIR VALUE GAP", 
@@ -114,12 +114,12 @@ printupcs    = input.color(color.orange, "", inline="print", group="LIQUIDITY CO
 printdowncs  = input.color(color.blue, "", inline="print", group="LIQUIDITY CONCEPTS")
 showside     = input.bool(false, "Buyside & Sellside", tooltip="Display Liquidity side", inline="side", group="LIQUIDITY CONCEPTS")
 sidemode     = input.string("Area", "", ["Area", "Line"], inline="side", group="LIQUIDITY CONCEPTS")
-buysidecss   = input.color(color.new(#009933, 45), "", inline="side", group="LIQUIDITY CONCEPTS")
-sidesidecss  = input.color(color.new(#cc3300, 45), "", inline="side", group="LIQUIDITY CONCEPTS")
+buysidecss   = input.color(color.new(#009933, 20), "", inline="side", group="LIQUIDITY CONCEPTS")
+sidesidecss  = input.color(color.new(#cc3300, 20), "", inline="side", group="LIQUIDITY CONCEPTS")
 showzone     = input.bool(false, "Sweep Area", "Show Sweep liquidation zone", "sz", "LIQUIDITY CONCEPTS")
 zonethresh   = input.int(10, "", inline="sz", group="LIQUIDITY CONCEPTS", minval=2)
-upzone       = input.color(color.new(#089981, 45), "", inline="sz", group="LIQUIDITY CONCEPTS")
-dnzone       = input.color(color.new(#f23645, 45), "", inline="sz", group="LIQUIDITY CONCEPTS")
+upzone       = input.color(color.new(#089981, 20), "", inline="sz", group="LIQUIDITY CONCEPTS")
+dnzone       = input.color(color.new(#f23645, 20), "", inline="sz", group="LIQUIDITY CONCEPTS")
 
 //}
 _                                                                                                                                                                                                                                        ='
@@ -2189,9 +2189,9 @@ structure(color upcss, color dncss, bool draw, bool internal, int limit) =>
                                x     = obj.x1
                              , y     = obj.y
                              , xloc  = xloc.bar_time
-                             , color = color.new(obj.css, 35)
+                             , color = color.new(obj.css, 5)
                              , style = label.style_circle
-                             , size  = size.tiny
+                             , size  = size.small
                               )
                              )
 
@@ -2228,9 +2228,9 @@ structure(color upcss, color dncss, bool draw, bool internal, int limit) =>
                                    x     = obj.x1
                                  , y     = obj.y
                                  , xloc  = xloc.bar_time
-                                 , color = color.new(obj.css, 35)
+                                 , color = color.new(obj.css, 5)
                                  , style = label.style_circle
-                                 , size  = size.tiny
+                                 , size  = size.small
                                   )
                                  )
 
